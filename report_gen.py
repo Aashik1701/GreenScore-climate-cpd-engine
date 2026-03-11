@@ -1,0 +1,118 @@
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+import io
+from datetime import datetime
+
+
+def generate_pdf_report(df, scenario, avg_baseline, avg_cpd):
+    """
+    Generate an RBI Climate Risk Disclosure PDF report.
+    Aligned with RBI Draft Disclosure Framework (Feb 2024).
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Title
+    story.append(Paragraph("GreenScore Climate Risk Disclosure Report", styles['Title']))
+    story.append(Paragraph(
+        f"RBI Climate-Related Financial Risk Framework | Generated: {datetime.now().strftime('%Y-%m-%d')}",
+        styles['Normal']
+    ))
+    story.append(Spacer(1, 20))
+    
+    # Section 1: Portfolio Overview
+    story.append(Paragraph("1. Portfolio Overview", styles['Heading2']))
+    story.append(Paragraph(f"Total Loans Analyzed: {len(df):,}", styles['Normal']))
+    story.append(Paragraph(f"NGFS Scenario: {scenario.title()} Transition", styles['Normal']))
+    story.append(Spacer(1, 12))
+    
+    # Section 2: Climate Risk Metrics
+    story.append(Paragraph("2. Climate Risk Metrics", styles['Heading2']))
+    data = [
+        ['Metric', 'Value'],
+        ['Average Baseline PD', f"{avg_baseline:.4f}"],
+        ['Average Climate-Adjusted PD (CPD 2030)', f"{avg_cpd:.4f}"],
+        ['Average PD Uplift', f"{((avg_cpd - avg_baseline) / (avg_baseline + 1e-8) * 100):.1f}%"],
+        ['High/Critical Risk Loans', f"{(df['Risk_Category'].isin(['High','Critical'])).sum():,}"],
+    ]
+    t = Table(data, colWidths=[250, 150])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.lightblue),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 12))
+    
+    # Section 3: Sector Exposure Summary
+    story.append(Paragraph("3. Sector-wise Climate Exposure", styles['Heading2']))
+    if 'purpose' in df.columns:
+        sector_summary = df.groupby('purpose').agg(
+            Count=('purpose', 'count'),
+            Avg_CPD=('CPD_2030', 'mean')
+        ).round(4).sort_values('Avg_CPD', ascending=False).head(10)
+        
+        sector_data = [['Sector/Purpose', 'Loan Count', 'Avg CPD 2030']]
+        for idx, row in sector_summary.iterrows():
+            sector_data.append([str(idx), f"{int(row['Count']):,}", f"{row['Avg_CPD']:.4f}"])
+        
+        st = Table(sector_data, colWidths=[180, 100, 120])
+        st.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ]))
+        story.append(st)
+    story.append(Spacer(1, 12))
+    
+    # Section 4: RBI Disclosure Alignment
+    story.append(Paragraph("4. RBI Disclosure Alignment", styles['Heading2']))
+    story.append(Paragraph(
+        "This report aligns with the RBI Draft Disclosure Framework (February 2024) "
+        "covering the following pillars:",
+        styles['Normal']
+    ))
+    story.append(Spacer(1, 6))
+    
+    pillars = [
+        "<b>Governance:</b> Board-level oversight of climate risk integration into credit risk assessment.",
+        "<b>Strategy:</b> Forward-looking scenario analysis using NGFS Phase V pathways to stress-test portfolio resilience.",
+        "<b>Risk Management:</b> Dual-overlay methodology combining physical hazard scores and transition cost projections at loan level.",
+        "<b>Metrics & Targets:</b> Quantified Climate-Adjusted PD (CPD), PD uplift percentages, and portfolio risk category distribution.",
+    ]
+    for p in pillars:
+        story.append(Paragraph(f"• {p}", styles['Normal']))
+        story.append(Spacer(1, 4))
+    
+    story.append(Spacer(1, 12))
+    
+    # Section 5: Methodology Note
+    story.append(Paragraph("5. Methodology", styles['Heading2']))
+    story.append(Paragraph(
+        "Climate-Adjusted Probability of Default (CPD) is computed using the formula: "
+        "CPD = Baseline_PD × (1 + Physical_Risk_Factor) × (1 + Transition_Risk_Factor). "
+        "Baseline PD is derived from an XGBoost classifier trained on historical loan performance data. "
+        "Physical risk scores are sourced from IMD and NDMA state-level vulnerability classifications. "
+        "Transition risk parameters follow NGFS Phase V carbon price pathways (January 2025). "
+        "Sectoral emission intensities are sourced from CPCB published data.",
+        styles['Normal']
+    ))
+    story.append(Spacer(1, 12))
+    
+    # Disclaimer
+    story.append(Paragraph("Disclaimer", styles['Heading3']))
+    story.append(Paragraph(
+        "This report is generated by the GreenScore CPD Engine for informational purposes. "
+        "Climate risk projections are based on scenario analysis and should not be considered deterministic forecasts. "
+        "All data sources are publicly available and independently verifiable.",
+        styles['Italic']
+    ))
+    
+    doc.build(story)
+    return buffer.getvalue()
