@@ -2,6 +2,9 @@ pandas==2.3.3
 numpy==2.4.3
 xgboost==3.2.0
 scikit-learn==1.8.0
+lightgbm==4.6.0
+optuna==4.7.0
+shap==0.51.0
 geopandas
 folium==0.20.0
 streamlit==1.55.0

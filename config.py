@@ -267,6 +267,96 @@ RISK_BINS = [0, 0.05, 0.15, 0.30, 1.0]
 RISK_LABELS = ['Low', 'Medium', 'High', 'Critical']
 
 # ─────────────────────────────────────────────────────────
+# Optuna Hyperparameter Tuning
+# ─────────────────────────────────────────────────────────
+OPTUNA_N_TRIALS = 50
+OPTUNA_PARAM_SPACE = {
+    'max_depth': (3, 10),
+    'learning_rate': (0.01, 0.3),
+    'n_estimators': (100, 500),
+    'subsample': (0.6, 1.0),
+    'colsample_bytree': (0.6, 1.0),
+    'min_child_weight': (1, 10),
+    'reg_alpha': (1e-8, 10.0),
+    'reg_lambda': (1e-8, 10.0),
+}
+
+# ─────────────────────────────────────────────────────────
+# LightGBM Hyperparameters
+# ─────────────────────────────────────────────────────────
+LIGHTGBM_PARAMS = {
+    'learning_rate': 0.05,
+    'max_depth': 6,
+    'n_estimators': 300,
+    'num_leaves': 31,
+    'random_state': 42,
+    'verbosity': -1,
+}
+
+# ─────────────────────────────────────────────────────────
+# Home Credit Dataset Adapter Mapping
+# ─────────────────────────────────────────────────────────
+HOMECREDIT_ORGANIZATION_TO_SECTOR = {
+    'Transport: type 1':    'transport',
+    'Transport: type 2':    'transport',
+    'Transport: type 3':    'transport',
+    'Transport: type 4':    'transport',
+    'Construction':         'construction',
+    'Industry: type 1':     'manufacturing',
+    'Industry: type 2':     'manufacturing',
+    'Industry: type 3':     'manufacturing',
+    'Industry: type 4':     'manufacturing',
+    'Industry: type 5':     'manufacturing',
+    'Industry: type 6':     'manufacturing',
+    'Industry: type 7':     'manufacturing',
+    'Industry: type 8':     'manufacturing',
+    'Industry: type 9':     'manufacturing',
+    'Industry: type 10':    'manufacturing',
+    'Industry: type 11':    'manufacturing',
+    'Industry: type 12':    'manufacturing',
+    'Industry: type 13':    'manufacturing',
+    'Trade: type 1':        'retail',
+    'Trade: type 2':        'retail',
+    'Trade: type 3':        'retail',
+    'Trade: type 4':        'retail',
+    'Trade: type 5':        'retail',
+    'Trade: type 6':        'retail',
+    'Trade: type 7':        'retail',
+    'Business Entity Type 1': 'services',
+    'Business Entity Type 2': 'services',
+    'Business Entity Type 3': 'services',
+    'Self-employed':        'services',
+    'Services':             'services',
+    'Medicine':             'healthcare',
+    'Bank':                 'services',
+    'Insurance':            'services',
+    'Government':           'services',
+    'Military':             'services',
+    'School':               'services',
+    'Kindergarten':         'services',
+    'University':           'services',
+    'Police':               'services',
+    'Security':             'services',
+    'Security Ministries':  'services',
+    'Postal':               'services',
+    'Religion':             'services',
+    'Electricity':          'thermal_power',
+    'Emergency':            'services',
+    'Hotel':                'services',
+    'Restaurant':           'services',
+    'Telecom':              'technology',
+    'Realtor':              'construction',
+    'Housing':              'construction',
+    'Agriculture':          'agriculture',
+    'Cleaning':             'services',
+    'Culture':              'services',
+    'Mobile':               'technology',
+    'Advertising':          'services',
+    'Legal Services':       'services',
+    'XNA':                  'other',
+}
+
+# ─────────────────────────────────────────────────────────
 # State Coordinates (for Folium heatmap)
 # ─────────────────────────────────────────────────────────
 US_STATE_COORDS = {

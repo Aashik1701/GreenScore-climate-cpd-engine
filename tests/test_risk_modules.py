@@ -201,3 +201,109 @@ class TestConfig:
     def test_risk_labels_count(self):
         """Number of risk labels should be one less than bins."""
         assert len(config.RISK_LABELS) == len(config.RISK_BINS) - 1
+
+
+# ─────────────────────────────────────────────────────────
+# LightGBM Config Tests
+# ─────────────────────────────────────────────────────────
+
+class TestLightGBMConfig:
+    """Tests for LightGBM configuration."""
+
+    def test_lightgbm_params_exist(self):
+        """LightGBM params should be defined in config."""
+        assert hasattr(config, 'LIGHTGBM_PARAMS')
+        assert 'learning_rate' in config.LIGHTGBM_PARAMS
+        assert 'n_estimators' in config.LIGHTGBM_PARAMS
+
+    def test_lightgbm_import(self):
+        """LightGBM should be importable."""
+        from lightgbm import LGBMClassifier
+        lgbm = LGBMClassifier(**config.LIGHTGBM_PARAMS)
+        assert lgbm is not None
+
+
+# ─────────────────────────────────────────────────────────
+# Optuna Config Tests
+# ─────────────────────────────────────────────────────────
+
+class TestOptunaConfig:
+    """Tests for Optuna hyperparameter tuning configuration."""
+
+    def test_optuna_n_trials_positive(self):
+        """Number of Optuna trials should be positive."""
+        assert config.OPTUNA_N_TRIALS > 0
+
+    def test_optuna_param_space_valid(self):
+        """Optuna param space should have valid ranges."""
+        for param, (low, high) in config.OPTUNA_PARAM_SPACE.items():
+            assert low < high, f"{param} has invalid range: [{low}, {high}]"
+
+    def test_optuna_import(self):
+        """Optuna should be importable."""
+        import optuna
+        assert optuna is not None
+
+
+# ─────────────────────────────────────────────────────────
+# Dataset Adapter Tests
+# ─────────────────────────────────────────────────────────
+
+class TestDatasetAdapters:
+    """Tests for dataset adapter functions."""
+
+    def test_home_credit_adapter_schema(self):
+        """Home Credit adapter should produce required pipeline columns."""
+        try:
+            from dataset_adapters import adapt_home_credit
+            df = adapt_home_credit(nrows=100)
+            required = ['default', 'annual_inc', 'loan_amnt', 'installment',
+                        'emp_length', 'fico_range_low', 'dti', 'int_rate',
+                        'purpose', 'addr_state']
+            for col in required:
+                assert col in df.columns, f"Missing column: {col}"
+        except FileNotFoundError:
+            pytest.skip("Home Credit dataset not available")
+
+    def test_home_credit_adapter_values(self):
+        """Home Credit adapted values should be in valid ranges."""
+        try:
+            from dataset_adapters import adapt_home_credit
+            df = adapt_home_credit(nrows=100)
+            assert df['default'].isin([0, 1]).all()
+            assert (df['annual_inc'] >= 0).all()
+            assert (df['fico_range_low'] >= 300).all()
+            assert (df['fico_range_low'] <= 850).all()
+        except FileNotFoundError:
+            pytest.skip("Home Credit dataset not available")
+
+    def test_indian_bank_adapter_schema(self):
+        """Indian Bank adapter should produce required pipeline columns."""
+        try:
+            from dataset_adapters import adapt_indian_bank
+            df = adapt_indian_bank(nrows=100)
+            required = ['default', 'annual_inc', 'loan_amnt', 'installment',
+                        'emp_length', 'fico_range_low', 'dti', 'int_rate',
+                        'purpose', 'addr_state']
+            for col in required:
+                assert col in df.columns, f"Missing column: {col}"
+        except FileNotFoundError:
+            pytest.skip("Indian Bank dataset not available")
+
+    def test_indian_bank_adapter_indian_states(self):
+        """Indian Bank adapter should assign Indian state names."""
+        try:
+            from dataset_adapters import adapt_indian_bank
+            df = adapt_indian_bank(nrows=100)
+            indian_states = set(config.INDIA_STATE_COORDS.keys())
+            assigned = set(df['addr_state'].unique())
+            assert assigned.issubset(indian_states), f"Non-Indian states found: {assigned - indian_states}"
+        except FileNotFoundError:
+            pytest.skip("Indian Bank dataset not available")
+
+    def test_dataset_registry(self):
+        """Dataset registry should have all three datasets."""
+        from dataset_adapters import DATASET_REGISTRY
+        assert 'lendingclub' in DATASET_REGISTRY
+        assert 'home_credit' in DATASET_REGISTRY
+        assert 'indian_bank' in DATASET_REGISTRY
