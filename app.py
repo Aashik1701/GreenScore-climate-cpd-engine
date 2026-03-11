@@ -1,40 +1,70 @@
-import streamlit as st
-import pandas as pd
+"""
+GreenScore — Streamlit Dashboard
+==================================
+Main entry point for the Climate-Adjusted Credit Risk Engine.
+Provides scenario selection, CSV upload, CPD computation,
+interactive charts, geographic heatmap, and report generation.
+"""
+
+import logging
+
+import joblib
 import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 import folium
 from streamlit_folium import st_folium
-import pickle
-import matplotlib.pyplot as plt
-import io
+
+import config
 from cpd_engine import get_baseline_pd
 from physical_risk import apply_physical_risk
 from transition_risk import apply_transition_risk
 from report_gen import generate_pdf_report
 
+logger = logging.getLogger(__name__)
+
 # ── Page Config ──
 st.set_page_config(
     page_title="GreenScore CPD Engine",
     page_icon="🌍",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("🌍 GreenScore: Climate-Adjusted Probability of Default")
 st.caption("B2B SaaS | RBI Disclosure Aligned | NGFS Phase V Scenarios")
 
-# ── Sidebar Controls ──
+# ─────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────
+REQUIRED_COLS = ['dti', 'annual_inc', 'fico_range_low', 'int_rate', 'installment', 'emp_length']
+OPTIONAL_COLS = ['addr_state', 'purpose', 'loan_amnt']
+
 with st.sidebar:
     st.header("⚙️ Scenario Settings")
     scenario = st.selectbox(
         "NGFS Carbon Price Scenario",
-        ['orderly', 'disorderly', 'hot_house'],
-        help="Orderly=~$100/tCO2, Disorderly=~$250, Hot House=~$25"
+        list(config.CARBON_PRICES.keys()),
+        format_func=lambda x: x.replace('_', ' ').title(),
+        help="Orderly ≈ $100/tCO₂, Disorderly ≈ $250/tCO₂, Hot House ≈ $25/tCO₂",
     )
-    carbon_price_label = {
-        'orderly': '$100/tCO2',
-        'disorderly': '$250/tCO2',
-        'hot_house': '$25/tCO2'
-    }
-    st.metric("Carbon Price (2030)", carbon_price_label[scenario])
+    carbon_price = config.CARBON_PRICES[scenario]
+    st.metric("Carbon Price (2030)", f"${carbon_price}/tCO₂")
+
+    st.markdown("---")
+    st.subheader("🎚️ Sensitivity Analysis")
+    severity_factor = st.slider(
+        "Physical Risk Severity Factor",
+        min_value=0.1, max_value=0.5, value=config.SEVERITY_FACTOR, step=0.05,
+        help="Higher = greater PD uplift from physical hazards. Default 0.3 per Bell & van Vuuren (2022).",
+    )
+    transition_scaling = st.slider(
+        "Transition Risk Scaling Factor",
+        min_value=0.1, max_value=0.6, value=config.TRANSITION_SCALING, step=0.05,
+        help="Higher = greater PD uplift from carbon costs. Default 0.4. Range 0.2–0.6 in literature.",
+    )
+
     st.markdown("---")
     st.markdown("**Model**: XGBoost + Physical + Transition Risk")
     st.markdown("**Regulatory**: RBI Climate Risk Framework 2024")
@@ -44,219 +74,310 @@ with st.sidebar:
     st.markdown("- Bouchet, Dayan & Contoux (2022)")
     st.markdown("- NGFS Phase V Scenarios (2025)")
 
-# ── File Upload ──
+
+# ─────────────────────────────────────────────────────────
+# Helper: Compute CPD for a given scenario + factors
+# ─────────────────────────────────────────────────────────
+def compute_cpd(df, model, scenario_key, sev_factor, trans_scaling):
+    """Run the full CPD pipeline and return baseline_pd, cpd arrays."""
+    baseline_pd = get_baseline_pd(model, df)
+
+    loc_col = 'addr_state' if 'addr_state' in df.columns else None
+    purpose_col = 'purpose' if 'purpose' in df.columns else None
+    income_col = 'annual_inc'
+
+    if loc_col:
+        pd_physical = apply_physical_risk(baseline_pd, df[loc_col], severity_factor=sev_factor)
+    else:
+        pd_physical = baseline_pd.copy()
+
+    if purpose_col:
+        sector_col_series = df['sector'] if 'sector' in df.columns else None
+        cpd = apply_transition_risk(
+            pd_physical, df[purpose_col], df[income_col],
+            scenario=scenario_key, transition_scaling=trans_scaling,
+            sector_series=sector_col_series,
+        )
+    else:
+        cpd = pd_physical.copy()
+
+    return baseline_pd, cpd
+
+
+# ─────────────────────────────────────────────────────────
+# File Upload + Validation
+# ─────────────────────────────────────────────────────────
 uploaded = st.file_uploader(
     "📂 Upload Loan Portfolio (CSV)",
     type=['csv'],
-    help="Required columns: dti, annual_inc, fico_range_low, int_rate, installment, emp_length, addr_state, purpose"
+    help=f"Required: {', '.join(REQUIRED_COLS)}. Optional: {', '.join(OPTIONAL_COLS)}",
 )
 
 if uploaded:
     df = pd.read_csv(uploaded, low_memory=False)
+
+    # ── Input Validation ──
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        st.error(f"❌ **Missing required columns:** {', '.join(missing)}")
+        st.markdown("Your CSV must contain these columns:")
+        for col in REQUIRED_COLS:
+            icon = "✅" if col in df.columns else "❌"
+            st.markdown(f"  {icon} `{col}`")
+        st.stop()
+
+    # Clean numeric types
+    for col in ['dti', 'annual_inc', 'fico_range_low', 'installment']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '', regex=False), errors='coerce')
+    if 'int_rate' in df.columns:
+        df['int_rate'] = pd.to_numeric(df['int_rate'].astype(str).str.replace('%', '', regex=False), errors='coerce')
+    if 'emp_length' in df.columns:
+        df['emp_length'] = df['emp_length'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
+
     st.success(f"✅ Loaded {len(df):,} loans")
 
     with st.expander("📋 Preview Raw Data"):
-        st.dataframe(df.head(20))
+        st.dataframe(df.head(20), use_container_width=True)
 
-    # Load trained model
+    # ── Load Model ──
     try:
-        with open('models/baseline_pd_model.pkl', 'rb') as f:
-            model = pickle.load(f)
+        model = joblib.load('models/baseline_pd_model.pkl')
     except FileNotFoundError:
-        st.error("⚠️ Model not trained yet. Run `python cpd_engine.py` first to train the baseline PD model.")
+        st.error("⚠️ Model not trained yet. Run `python3 cpd_engine.py` first.")
         st.stop()
 
-    with st.spinner("🔄 Computing Climate-Adjusted PDs..."):
-        # Step 1: Baseline PD
-        baseline_pd = get_baseline_pd(model, df)
+    # ── Compute CPD ──
+    with st.spinner("🔄 Computing Climate-Adjusted PDs…"):
+        baseline_pd, cpd = compute_cpd(df, model, scenario, severity_factor, transition_scaling)
 
-        # Step 2: Physical Risk Overlay
-        loc_col = 'addr_state' if 'addr_state' in df.columns else df.columns[0]
-        pd_physical = apply_physical_risk(baseline_pd, df[loc_col])
-
-        # Step 3: Transition Risk Overlay
-        purpose_col = 'purpose' if 'purpose' in df.columns else 'loan_status'
-        income_col = 'annual_inc' if 'annual_inc' in df.columns else df.columns[0]
-        cpd = apply_transition_risk(pd_physical, df[purpose_col], df[income_col], scenario)
-
-        # Add computed columns
         df['Baseline_PD'] = baseline_pd
         df['CPD_2030'] = cpd
         df['PD_Uplift_%'] = ((cpd - baseline_pd) / (baseline_pd + 1e-8)) * 100
         df['Risk_Category'] = pd.cut(
-            cpd,
-            bins=[0, 0.05, 0.15, 0.30, 1.0],
-            labels=['Low', 'Medium', 'High', 'Critical']
+            cpd, bins=config.RISK_BINS, labels=config.RISK_LABELS, include_lowest=True,
         )
 
-    # ══════════════════════════════════════════════
-    # KEY METRICS
-    # ══════════════════════════════════════════════
-    st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Avg Baseline PD", f"{baseline_pd.mean():.4f}")
-    col2.metric("Avg CPD 2030", f"{cpd.mean():.4f}")
-    col3.metric("Avg PD Uplift", f"{df['PD_Uplift_%'].mean():.1f}%")
-    col4.metric("High/Critical Risk", f"{(df['Risk_Category'].isin(['High', 'Critical'])).sum():,}")
+    # ═══════════════════════════════════════════════
+    # TABS
+    # ═══════════════════════════════════════════════
+    tab_overview, tab_compare, tab_map, tab_sector, tab_top20, tab_results = st.tabs([
+        "📊 Overview", "🔀 Multi-Scenario", "🗺️ Heatmap", "🏭 Sectors", "🔝 Top 20 Risk", "📋 Results",
+    ])
 
-    # ══════════════════════════════════════════════
-    # RISK DISTRIBUTION CHARTS
-    # ══════════════════════════════════════════════
-    st.subheader("📊 Portfolio Risk Distribution")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # ── TAB 1: Overview ──
+    with tab_overview:
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Avg Baseline PD", f"{baseline_pd.mean():.4f}")
+        col2.metric("Avg CPD 2030", f"{cpd.mean():.4f}")
+        col3.metric("Avg PD Uplift", f"{df['PD_Uplift_%'].mean():.1f}%")
+        col4.metric("High/Critical", f"{(df['Risk_Category'].isin(['High', 'Critical'])).sum():,}")
 
-    # Histogram: Baseline PD vs CPD
-    axes[0].hist(baseline_pd, bins=50, alpha=0.6, label='Baseline PD', color='steelblue')
-    axes[0].hist(cpd, bins=50, alpha=0.6, label='CPD 2030', color='crimson')
-    axes[0].set_xlabel('Probability of Default')
-    axes[0].set_ylabel('Count')
-    axes[0].set_title('Baseline PD vs Climate-Adjusted PD')
-    axes[0].legend()
+        # Plotly histogram: Baseline vs CPD
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=baseline_pd, nbinsx=60, name='Baseline PD',
+            marker_color='steelblue', opacity=0.6,
+        ))
+        fig_hist.add_trace(go.Histogram(
+            x=cpd, nbinsx=60, name='CPD 2030',
+            marker_color='crimson', opacity=0.6,
+        ))
+        fig_hist.update_layout(
+            title='Baseline PD vs Climate-Adjusted PD',
+            xaxis_title='Probability of Default', yaxis_title='Count',
+            barmode='overlay', template='plotly_dark',
+            height=400,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
 
-    # Bar chart: Risk Categories
-    risk_counts = df['Risk_Category'].value_counts()
-    color_map = {'Low': '#2ecc71', 'Medium': '#f39c12', 'High': '#e67e22', 'Critical': '#e74c3c'}
-    bar_colors = [color_map.get(str(c), 'gray') for c in risk_counts.index]
-    axes[1].bar(risk_counts.index.astype(str), risk_counts.values, color=bar_colors)
-    axes[1].set_title('Risk Category Distribution')
-    axes[1].set_ylabel('Number of Loans')
+        # Risk category donut
+        risk_counts = df['Risk_Category'].value_counts().reset_index()
+        risk_counts.columns = ['Category', 'Count']
+        color_map = {'Low': '#2ecc71', 'Medium': '#f39c12', 'High': '#e67e22', 'Critical': '#e74c3c'}
+        fig_donut = px.pie(
+            risk_counts, names='Category', values='Count',
+            color='Category', color_discrete_map=color_map,
+            hole=0.45, title='Risk Category Distribution',
+        )
+        fig_donut.update_layout(template='plotly_dark', height=400)
+        st.plotly_chart(fig_donut, use_container_width=True)
 
-    plt.tight_layout()
-    st.pyplot(fig)
+    # ── TAB 2: Multi-Scenario Comparison ──
+    with tab_compare:
+        st.subheader("🔀 Multi-Scenario Comparison")
+        st.markdown("Side-by-side CPD analysis across all three NGFS scenarios.")
 
-    # ══════════════════════════════════════════════
-    # GEOGRAPHIC HEATMAP
-    # ══════════════════════════════════════════════
-    st.subheader("🗺️ Geographic Climate Risk Heatmap")
-    if loc_col in df.columns:
-        state_risk = df.groupby(loc_col)['CPD_2030'].mean().reset_index()
+        scenario_results = {}
+        for sc_name in config.CARBON_PRICES:
+            _, sc_cpd = compute_cpd(df, model, sc_name, severity_factor, transition_scaling)
+            scenario_results[sc_name] = sc_cpd
 
-        # Determine map center based on data (US vs India)
-        sample_states = df[loc_col].dropna().unique()[:5]
-        is_us_data = any(len(str(s).strip()) == 2 for s in sample_states)
+        # Metrics row
+        cols = st.columns(3)
+        sc_names = list(config.CARBON_PRICES.keys())
+        for i, sc_name in enumerate(sc_names):
+            sc_cpd = scenario_results[sc_name]
+            sc_label = sc_name.replace('_', ' ').title()
+            with cols[i]:
+                st.markdown(f"**{sc_label}** (${config.CARBON_PRICES[sc_name]}/tCO₂)")
+                st.metric("Avg CPD", f"{sc_cpd.mean():.4f}")
+                uplift = ((sc_cpd - baseline_pd) / (baseline_pd + 1e-8) * 100).mean()
+                st.metric("Avg Uplift", f"{uplift:.1f}%")
+                high_crit = (pd.cut(sc_cpd, bins=config.RISK_BINS, labels=config.RISK_LABELS).isin(['High', 'Critical'])).sum()
+                st.metric("High/Critical", f"{high_crit:,}")
 
-        if is_us_data:
-            m = folium.Map(location=[39.8, -98.5], zoom_start=4)
-            # Approximate US state coordinates
-            us_coords = {
-                'CA': [36.7, -119.4], 'FL': [27.6, -81.5], 'TX': [31.0, -100.0],
-                'NY': [42.2, -74.9], 'WA': [47.4, -121.5], 'LA': [30.5, -92.0],
-                'NC': [35.6, -79.8], 'SC': [33.8, -81.2], 'GA': [32.2, -83.4],
-                'AL': [32.3, -86.9], 'MS': [32.4, -89.6], 'NJ': [40.0, -74.5],
-                'PA': [41.2, -77.2], 'OH': [40.4, -82.8], 'IL': [40.0, -89.0],
-                'MI': [44.3, -85.6], 'VA': [37.4, -79.0], 'MD': [39.0, -76.6],
-                'AZ': [34.0, -111.1], 'CO': [39.5, -105.8], 'MN': [46.7, -94.7],
-                'WI': [43.8, -88.8], 'IN': [40.3, -86.1], 'MO': [38.6, -92.6],
-                'TN': [35.5, -86.6], 'KY': [37.8, -84.3], 'OR': [43.8, -120.6],
-                'NV': [38.8, -116.4], 'CT': [41.6, -72.7], 'MA': [42.4, -71.4],
-            }
-        else:
-            m = folium.Map(location=[20, 77], zoom_start=4)
-            us_coords = {}
+        # Overlay histogram
+        fig_compare = go.Figure()
+        for sc_name in sc_names:
+            fig_compare.add_trace(go.Histogram(
+                x=scenario_results[sc_name], nbinsx=50,
+                name=sc_name.replace('_', ' ').title(), opacity=0.5,
+            ))
+        fig_compare.update_layout(
+            title='CPD Distribution Across NGFS Scenarios',
+            xaxis_title='Climate-Adjusted PD', yaxis_title='Count',
+            barmode='overlay', template='plotly_dark', height=400,
+        )
+        st.plotly_chart(fig_compare, use_container_width=True)
 
-        for _, row in state_risk.iterrows():
-            state = str(row[loc_col]).strip()
-            cpd_val = float(row['CPD_2030'])
+    # ── TAB 3: Geographic Heatmap ──
+    with tab_map:
+        st.subheader("🗺️ Geographic Climate Risk Heatmap")
+        loc_col = 'addr_state' if 'addr_state' in df.columns else None
+        if loc_col:
+            state_risk = df.groupby(loc_col)['CPD_2030'].mean().reset_index()
 
-            if state in us_coords:
-                lat, lon = us_coords[state]
+            # Detect if US or India data
+            sample_states = df[loc_col].dropna().unique()[:10]
+            is_us = any(len(str(s).strip()) == 2 for s in sample_states)
+
+            if is_us:
+                m = folium.Map(location=[39.8, -98.5], zoom_start=4)
+                coord_map = config.US_STATE_COORDS
             else:
-                lat = 20 + np.random.uniform(-8, 8)
-                lon = 77 + np.random.uniform(-12, 12)
+                m = folium.Map(location=[20, 77], zoom_start=5)
+                coord_map = config.INDIA_STATE_COORDS
 
-            color = 'red' if cpd_val > 0.2 else ('orange' if cpd_val > 0.1 else 'green')
-            folium.CircleMarker(
-                location=[lat, lon],
-                radius=max(5, cpd_val * 40),
-                color=color,
-                fill=True,
-                fill_opacity=0.7,
-                popup=f"{state}: CPD={cpd_val:.4f}"
-            ).add_to(m)
+            for _, row in state_risk.iterrows():
+                state = str(row[loc_col]).strip()
+                cpd_val = float(row['CPD_2030'])
 
-        st_folium(m, width=700, height=450)
+                if state in coord_map:
+                    lat, lon = coord_map[state]
+                elif state in config.US_STATE_COORDS:
+                    lat, lon = config.US_STATE_COORDS[state]
+                elif state in config.INDIA_STATE_COORDS:
+                    lat, lon = config.INDIA_STATE_COORDS[state]
+                else:
+                    continue  # Skip unknown states instead of random placement
 
-    # ══════════════════════════════════════════════
-    # SECTOR ANALYSIS
-    # ══════════════════════════════════════════════
-    st.subheader("🏭 Sector-wise Climate Exposure")
-    if purpose_col in df.columns:
-        sector_df = df.groupby(purpose_col).agg(
-            Avg_Baseline_PD=('Baseline_PD', 'mean'),
-            Avg_CPD_2030=('CPD_2030', 'mean'),
-            Avg_Uplift=('PD_Uplift_%', 'mean'),
-            Loan_Count=(purpose_col, 'count')
-        ).round(4).reset_index()
-        sector_df = sector_df.sort_values('Avg_CPD_2030', ascending=False)
-        st.dataframe(sector_df, use_container_width=True)
+                color = 'red' if cpd_val > 0.2 else ('orange' if cpd_val > 0.1 else 'green')
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=max(5, cpd_val * 40),
+                    color=color, fill=True, fill_opacity=0.7,
+                    popup=f"<b>{state}</b><br>CPD: {cpd_val:.4f}",
+                    tooltip=f"{state}: {cpd_val:.4f}",
+                ).add_to(m)
 
-    # ══════════════════════════════════════════════
-    # LOAN-LEVEL RESULTS TABLE
-    # ══════════════════════════════════════════════
-    st.subheader("📋 Loan-Level CPD Results")
-    display_cols = [c for c in ['loan_amnt', loc_col, purpose_col,
-                                'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
+            st_folium(m, width=800, height=500)
+        else:
+            st.info("No `addr_state` column found. Upload data with state codes for the heatmap.")
+
+    # ── TAB 4: Sector Analysis ──
+    with tab_sector:
+        st.subheader("🏭 Sector-wise Climate Exposure")
+        purpose_col = 'purpose' if 'purpose' in df.columns else None
+        if purpose_col:
+            sector_df = df.groupby(purpose_col).agg(
+                Avg_Baseline_PD=('Baseline_PD', 'mean'),
+                Avg_CPD_2030=('CPD_2030', 'mean'),
+                Avg_Uplift=('PD_Uplift_%', 'mean'),
+                Loan_Count=(purpose_col, 'count'),
+            ).round(4).reset_index().sort_values('Avg_CPD_2030', ascending=False)
+
+            fig_sector = px.bar(
+                sector_df, x=purpose_col, y=['Avg_Baseline_PD', 'Avg_CPD_2030'],
+                barmode='group', title='Sector: Baseline PD vs CPD 2030',
+                color_discrete_sequence=['steelblue', 'crimson'],
+            )
+            fig_sector.update_layout(template='plotly_dark', height=400)
+            st.plotly_chart(fig_sector, use_container_width=True)
+            st.dataframe(sector_df, use_container_width=True)
+        else:
+            st.info("No `purpose` column found.")
+
+    # ── TAB 5: Top 20 Riskiest Loans ──
+    with tab_top20:
+        st.subheader("🔝 Top 20 Riskiest Loans")
+        top_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose', 'annual_inc',
+                                'fico_range_low', 'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
                     if c in df.columns]
-    st.dataframe(df[display_cols].head(200), use_container_width=True)
+        top20 = df.nlargest(20, 'CPD_2030')[top_cols]
+        st.dataframe(
+            top20.style.background_gradient(subset=['CPD_2030'], cmap='Reds'),
+            use_container_width=True,
+        )
 
-    # ══════════════════════════════════════════════
-    # DOWNLOADS
-    # ══════════════════════════════════════════════
+    # ── TAB 6: Full Results ──
+    with tab_results:
+        st.subheader("📋 Loan-Level CPD Results")
+        display_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose',
+                                    'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
+                        if c in df.columns]
+        st.dataframe(df[display_cols].head(500), use_container_width=True)
+
+    # ═══════════════════════════════════════════════
+    # EXPORTS
+    # ═══════════════════════════════════════════════
     st.markdown("---")
     st.subheader("⬇️ Export Results")
     col_a, col_b = st.columns(2)
 
     with col_a:
-        csv = df[display_cols].to_csv(index=False)
+        csv_data = df[display_cols].to_csv(index=False)
         st.download_button(
-            "📥 Download Results CSV",
-            csv,
-            "cpd_results.csv",
-            "text/csv",
-            use_container_width=True
+            "📥 Download Results CSV", csv_data,
+            "cpd_results.csv", "text/csv", use_container_width=True,
         )
 
     with col_b:
-        if st.button("📄 Generate RBI Disclosure PDF", use_container_width=True):
-            with st.spinner("Generating PDF report..."):
-                pdf_bytes = generate_pdf_report(df, scenario, baseline_pd.mean(), cpd.mean())
-                st.download_button(
-                    "📥 Download PDF Report",
-                    pdf_bytes,
-                    "rbi_climate_disclosure.pdf",
-                    use_container_width=True
-                )
+        # Pre-generate PDF to fix two-click bug
+        pdf_bytes = generate_pdf_report(df, scenario, baseline_pd.mean(), cpd.mean())
+        st.download_button(
+            "📄 Download RBI Disclosure PDF", pdf_bytes,
+            "rbi_climate_disclosure.pdf", "application/pdf", use_container_width=True,
+        )
 
 else:
     # ── Landing State ──
     st.info("👆 Upload a loan portfolio CSV to begin analysis")
-
     st.markdown("---")
     st.markdown("### 📐 CPD Formula")
-    st.latex(r"CPD = PD_{baseline} \times (1 + \alpha_{physical}) \times (1 + \alpha_{transition})")
+    st.latex(r"CPD = PD_{\text{baseline}} \times (1 + \alpha_{\text{physical}}) \times (1 + \alpha_{\text{transition}})")
 
     st.markdown("### 📌 Expected CSV Columns")
-    st.markdown("""
-    | Column | Description |
-    |---|---|
-    | `dti` | Debt-to-Income ratio |
-    | `annual_inc` | Annual income |
-    | `fico_range_low` | FICO credit score |
-    | `int_rate` | Interest rate |
-    | `installment` | Monthly installment |
-    | `emp_length` | Employment length |
-    | `addr_state` | State/location code |
-    | `purpose` | Loan purpose/sector |
-    """)
+    col_info = pd.DataFrame({
+        'Column': REQUIRED_COLS + OPTIONAL_COLS,
+        'Required': ['✅'] * len(REQUIRED_COLS) + ['Optional'] * len(OPTIONAL_COLS),
+        'Description': [
+            'Debt-to-Income ratio', 'Annual income ($)', 'FICO credit score',
+            'Interest rate (%)', 'Monthly installment ($)', 'Employment length',
+            'State code (e.g. CA, FL)', 'Loan purpose / sector', 'Loan amount ($)',
+        ],
+    })
+    st.dataframe(col_info, hide_index=True, use_container_width=True)
 
     st.markdown("### 🔬 How It Works")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("**1️⃣ Baseline PD**")
-        st.markdown("XGBoost classifier trained on historical loan performance data (LendingClub).")
+        st.markdown("XGBoost classifier trained on historical loan performance data.")
     with col2:
         st.markdown("**2️⃣ Physical Risk**")
-        st.markdown("State-level flood, cyclone, and heat hazard scores from IMD/NDMA classifications.")
+        st.markdown("State-level flood, cyclone, and heat hazard scores (IMD/NDMA/FEMA).")
     with col3:
         st.markdown("**3️⃣ Transition Risk**")
-        st.markdown("NGFS Phase V carbon price pathways × sector emission intensity → carbon cost burden.")
+        st.markdown("NGFS Phase V carbon price × sector emission intensity → carbon cost burden.")

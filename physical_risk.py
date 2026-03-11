@@ -1,46 +1,71 @@
-import pandas as pd
+"""
+GreenScore — Physical Risk Overlay
+====================================
+Maps borrower location (state) to a physical hazard score (0–1)
+and applies a severity-weighted PD uplift based on Bell & van Vuuren (2022).
+
+Sources:
+  - India: IMD flood zone classifications, NDMA disaster risk index
+  - US:    FEMA National Risk Index, NOAA historical cyclone/hurricane tracks
+"""
+
+import logging
+from typing import Optional
+
 import numpy as np
+import pandas as pd
 
-# ── State-level physical risk scores (0–1 scale) ──
-# Based on flood/cyclone/heat exposure
-# Sources: IMD flood zone data, NDMA cyclone tracks, disaster risk index
-INDIA_STATE_RISK = {
-    # Indian states
-    'Andhra Pradesh': 0.75, 'Assam': 0.85, 'Bihar': 0.80,
-    'Gujarat': 0.65, 'Karnataka': 0.45, 'Kerala': 0.70,
-    'Maharashtra': 0.55, 'Odisha': 0.90, 'Tamil Nadu': 0.65,
-    'Uttar Pradesh': 0.60, 'West Bengal': 0.85,
-    'Rajasthan': 0.50, 'Madhya Pradesh': 0.45,
-    'Punjab': 0.40, 'Haryana': 0.35,
-    # US states (for LendingClub data)
-    'CA': 0.60, 'FL': 0.80, 'TX': 0.65, 'NY': 0.45,
-    'WA': 0.55, 'LA': 0.85, 'NC': 0.60, 'SC': 0.65,
-    'GA': 0.55, 'AL': 0.70, 'MS': 0.75, 'NJ': 0.50,
-    'PA': 0.40, 'OH': 0.35, 'IL': 0.40, 'MI': 0.38,
-    'VA': 0.45, 'MD': 0.48, 'AZ': 0.42, 'CO': 0.38,
-    'MN': 0.40, 'WI': 0.38, 'IN': 0.42, 'MO': 0.50,
-    'TN': 0.52, 'KY': 0.48, 'OR': 0.45, 'NV': 0.35,
-    'CT': 0.45, 'MA': 0.42, 'OTHER': 0.45
-}
+import config
 
-# Calibrated from Bell & van Vuuren (2022) scaling factor matrix
-SEVERITY_FACTOR = 0.3
+logger = logging.getLogger(__name__)
 
 
 def compute_physical_risk_score(location_series: pd.Series) -> pd.Series:
-    """Map location (state code or name) to physical risk score (0–1)."""
-    return location_series.map(
-        lambda x: INDIA_STATE_RISK.get(str(x).strip(), INDIA_STATE_RISK['OTHER'])
+    """
+    Map location (state code or full name) to a physical risk score (0–1).
+
+    Unknown states fall back to the ``OTHER`` default (0.45).
+    """
+    scores = location_series.map(
+        lambda x: config.STATE_PHYSICAL_RISK.get(
+            str(x).strip(), config.STATE_PHYSICAL_RISK['OTHER']
+        )
     )
+    n_fallback = (scores == config.STATE_PHYSICAL_RISK['OTHER']).sum()
+    if n_fallback > 0:
+        logger.debug("%d locations mapped to fallback risk score.", n_fallback)
+    return scores
 
 
-def apply_physical_risk(baseline_pd: np.ndarray,
-                         location_series: pd.Series) -> np.ndarray:
+def apply_physical_risk(
+    baseline_pd: np.ndarray,
+    location_series: pd.Series,
+    severity_factor: Optional[float] = None,
+) -> np.ndarray:
     """
     Apply physical risk overlay to baseline PD.
-    Formula from Bell & van Vuuren (2022):
-        PD_physical = PD_base × (1 + PR × severity_factor)
+
+    Formula (Bell & van Vuuren 2022):
+        PD_physical = PD_base × (1 + risk_score × severity_factor)
+
+    Parameters
+    ----------
+    baseline_pd : np.ndarray
+        Baseline probability-of-default values.
+    location_series : pd.Series
+        Borrower state codes or names.
+    severity_factor : float, optional
+        Override the default severity factor from config (0.3).
     """
+    sf = severity_factor if severity_factor is not None else config.SEVERITY_FACTOR
+    baseline_pd = np.asarray(baseline_pd, dtype=float)
+    if len(baseline_pd) != len(location_series):
+        raise ValueError(f"Length mismatch: baseline_pd ({len(baseline_pd)}) != location_series ({len(location_series)})")
     pr_scores = compute_physical_risk_score(location_series).values
-    adjusted_pd = baseline_pd * (1 + pr_scores * SEVERITY_FACTOR)
+    adjusted_pd = baseline_pd * (1 + pr_scores * sf)
+    logger.info(
+        "Physical risk applied — severity_factor=%.2f, mean_uplift=%.4f",
+        sf,
+        (adjusted_pd - baseline_pd).mean(),
+    )
     return np.clip(adjusted_pd, 0, 1)
