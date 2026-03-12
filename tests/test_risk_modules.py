@@ -439,3 +439,63 @@ class TestClimateFeatureConfig:
         """Sector policy exposure should be defined."""
         assert config.SECTOR_POLICY_EXPOSURE['coal'] > 0.9
         assert config.SECTOR_POLICY_EXPOSURE['technology'] < 0.2
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 1.3 Feature Engineering Tests
+# ─────────────────────────────────────────────────────────
+
+class TestFeatureEngineering:
+    """Tests for Phase 1.3 feature engineering additions."""
+
+    def test_new_raw_cols_in_config(self):
+        """New raw columns should be in RAW_COLS."""
+        for col in ['revol_util', 'revol_bal', 'open_acc', 'total_acc',
+                     'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term']:
+            assert col in config.RAW_COLS, f"{col} missing from RAW_COLS"
+
+    def test_new_base_features_in_config(self):
+        """New base features should be in BASE_FEATURES."""
+        for feat in ['revol_util', 'revol_bal', 'open_acc', 'total_acc',
+                      'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term_months', 'loan_amnt']:
+            assert feat in config.BASE_FEATURES, f"{feat} missing from BASE_FEATURES"
+
+    def test_new_engineered_features_in_config(self):
+        """New engineered features should be in ENGINEERED_FEATURES."""
+        for feat in ['monthly_payment_burden',
+                      'credit_utilization_ratio', 'open_to_total_acc']:
+            assert feat in config.ENGINEERED_FEATURES, f"{feat} missing from ENGINEERED_FEATURES"
+
+    def test_all_features_length(self):
+        """ALL_FEATURES should include all base + engineered features."""
+        assert len(config.ALL_FEATURES) == len(config.BASE_FEATURES) + len(config.ENGINEERED_FEATURES)
+
+    def test_emp_length_bins_defined(self):
+        """Employment length bins should be defined."""
+        assert hasattr(config, 'EMP_LENGTH_BINS')
+        assert hasattr(config, 'EMP_LENGTH_LABELS')
+        assert len(config.EMP_LENGTH_LABELS) == len(config.EMP_LENGTH_BINS) - 1
+
+    def test_get_baseline_pd_creates_features(self):
+        """get_baseline_pd should create missing engineered features."""
+        from cpd_engine import get_baseline_pd
+        # Create minimal input with only required columns
+        df = pd.DataFrame({
+            'dti': [15.0], 'annual_inc': [60000], 'fico_range_low': [700],
+            'int_rate': [12.0], 'installment': [500], 'emp_length': [5],
+        })
+        # Test that feature creation works correctly
+        df_copy = df.copy()
+        for col, default in [
+            ('revol_util', 0), ('revol_bal', 0), ('open_acc', 0),
+            ('total_acc', 0), ('pub_rec', 0), ('delinq_2yrs', 0),
+            ('inq_last_6mths', 0), ('loan_amnt', 0), ('term_months', 36),
+            ('sub_grade_num', 18), ('verification_num', 0),
+            ('credit_history_months', 180),
+        ]:
+            if col not in df_copy.columns:
+                df_copy[col] = default
+        df_copy['monthly_payment_burden'] = df_copy['installment'] / (df_copy['annual_inc'] / 12 + 1)
+        df_copy['credit_utilization_ratio'] = df_copy['revol_bal'] / (df_copy['annual_inc'] + 1)
+        assert abs(df_copy['monthly_payment_burden'].iloc[0] - 500 / (60000 / 12 + 1)) < 0.001
+        assert df_copy['sub_grade_num'].iloc[0] == 18

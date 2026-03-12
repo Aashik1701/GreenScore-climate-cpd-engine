@@ -73,7 +73,34 @@ def load_data(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
         df['emp_length'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
     )
 
-    # ── Feature Engineering ──
+    # ── Phase 1.3: Clean new raw columns ──
+    df['revol_util'] = (
+        df['revol_util'].astype(str).str.replace('%', '', regex=False)
+    )
+    df['revol_util'] = pd.to_numeric(df['revol_util'], errors='coerce').fillna(0)
+    df['revol_bal'] = pd.to_numeric(df['revol_bal'], errors='coerce').fillna(0)
+    df['open_acc'] = pd.to_numeric(df['open_acc'], errors='coerce').fillna(0)
+    df['total_acc'] = pd.to_numeric(df['total_acc'], errors='coerce').fillna(0)
+    df['pub_rec'] = pd.to_numeric(df['pub_rec'], errors='coerce').fillna(0)
+    df['delinq_2yrs'] = pd.to_numeric(df['delinq_2yrs'], errors='coerce').fillna(0)
+    df['inq_last_6mths'] = pd.to_numeric(df['inq_last_6mths'], errors='coerce').fillna(0)
+    df['term_months'] = (
+        df['term'].astype(str).str.extract(r'(\d+)').astype(float).fillna(36)
+    )
+
+    # Sub-grade: ordinal encode A1=1 ... G5=35
+    df['sub_grade_num'] = df['sub_grade'].map(config.SUB_GRADE_ORDER).fillna(18)
+
+    # Verification status: ordinal encode
+    df['verification_num'] = df['verification_status'].map(config.VERIFICATION_MAP).fillna(0)
+
+    # Credit history length in months from earliest_cr_line
+    df['earliest_cr_line'] = pd.to_datetime(df['earliest_cr_line'], format='%b-%Y', errors='coerce')
+    df['credit_history_months'] = (
+        (pd.Timestamp('2018-01-01') - df['earliest_cr_line']).dt.days / 30.44
+    ).fillna(180)
+
+    # ── Feature Engineering (original) ──
     df['income_to_installment'] = df['annual_inc'] / (df['installment'] * 12 + 1)
     df['loan_to_income'] = df['loan_amnt'] / (df['annual_inc'] + 1)
     df['dti_bucket'] = pd.cut(
@@ -82,6 +109,12 @@ def load_data(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
     df['fico_bucket'] = pd.cut(
         df['fico_range_low'], bins=config.FICO_BINS, labels=config.FICO_LABELS, include_lowest=True
     ).astype(float)
+
+    # ── Phase 1.3: New engineered features ──
+    # Additional ratios
+    df['monthly_payment_burden'] = df['installment'] / (df['annual_inc'] / 12 + 1)
+    df['credit_utilization_ratio'] = df['revol_bal'] / (df['annual_inc'] + 1)
+    df['open_to_total_acc'] = df['open_acc'] / (df['total_acc'] + 1)
 
     logger.info(
         "Loaded %s records. Default rate: %.3f",
@@ -201,11 +234,10 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # Enrich with climate features if not already present
-    if not all(f in df.columns for f in config.CLIMATE_FEATURES):
-        df = add_climate_features(df)
-
-    X = _prepare_features(df, include_climate=True)
+    # Train on financial features only — climate adjustments are applied
+    # post-prediction by physical_risk.py and transition_risk.py (CPD formula).
+    # Including climate features during training adds noise without signal.
+    X = _prepare_features(df, include_climate=False)
     y = df['default']
 
     # Class imbalance ratio
@@ -430,14 +462,27 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
             df['fico_range_low'], bins=config.FICO_BINS, labels=config.FICO_LABELS, include_lowest=True
         ).astype(float)
 
-    # Add climate features if the model expects them
-    model_n_features = getattr(model, 'n_features_in_', len(config.ALL_FEATURES))
-    if model_n_features > len(config.ALL_FEATURES):
-        if not all(f in df.columns for f in config.CLIMATE_FEATURES):
-            df = add_climate_features(df)
-        feature_cols = config.ALL_FEATURES_CLIMATE
-    else:
-        feature_cols = config.ALL_FEATURES
+    # ── Phase 1.3: Ensure new raw features have defaults ──
+    for col, default in [
+        ('revol_util', 0), ('revol_bal', 0), ('open_acc', 0),
+        ('total_acc', 0), ('pub_rec', 0), ('delinq_2yrs', 0),
+        ('inq_last_6mths', 0), ('loan_amnt', 0), ('term_months', 36),
+        ('sub_grade_num', 18), ('verification_num', 0),
+        ('credit_history_months', 180),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+
+    # ── Phase 1.3: Ensure new engineered features exist ──
+    if 'monthly_payment_burden' not in df.columns:
+        df['monthly_payment_burden'] = df['installment'] / (df['annual_inc'] / 12 + 1)
+    if 'credit_utilization_ratio' not in df.columns:
+        df['credit_utilization_ratio'] = df.get('revol_bal', 0) / (df['annual_inc'] + 1)
+    if 'open_to_total_acc' not in df.columns:
+        df['open_to_total_acc'] = df.get('open_acc', 0) / (df.get('total_acc', 0) + 1)
+
+    # Use financial features only — climate adjustments are post-prediction
+    feature_cols = config.ALL_FEATURES
 
     X = df[feature_cols].fillna(df[feature_cols].median())
     return model.predict_proba(X)[:, 1]

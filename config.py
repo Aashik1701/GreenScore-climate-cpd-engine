@@ -21,11 +21,20 @@ RAW_COLS = [
     'loan_status', 'loan_amnt', 'dti', 'annual_inc',
     'fico_range_low', 'int_rate', 'installment',
     'emp_length', 'home_ownership', 'purpose', 'addr_state',
+    # Phase 1.3 — additional predictive columns
+    'revol_util', 'revol_bal', 'open_acc', 'total_acc',
+    'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term',
+    'sub_grade', 'verification_status', 'earliest_cr_line',
 ]
 
 BASE_FEATURES = [
     'dti', 'annual_inc', 'fico_range_low', 'int_rate',
     'installment', 'emp_length',
+    # Phase 1.3 — additional raw features
+    'revol_util', 'revol_bal', 'open_acc', 'total_acc',
+    'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'loan_amnt',
+    'term_months', 'sub_grade_num', 'verification_num',
+    'credit_history_months',
 ]
 
 ENGINEERED_FEATURES = [
@@ -33,6 +42,10 @@ ENGINEERED_FEATURES = [
     'loan_to_income',          # loan_amnt / (annual_inc + 1)
     'dti_bucket',              # binned DTI
     'fico_bucket',             # binned FICO
+    # Phase 1.3 — additional ratios (tree-friendly)
+    'monthly_payment_burden',  # installment / (annual_inc / 12 + 1)
+    'credit_utilization_ratio', # revol_bal / (annual_inc + 1)
+    'open_to_total_acc',       # open_acc / (total_acc + 1)
 ]
 
 ALL_FEATURES = BASE_FEATURES + ENGINEERED_FEATURES
@@ -71,6 +84,16 @@ DTI_LABELS = [0, 1, 2, 3]
 # FICO bins: [300–580 (poor), 580–670 (fair), 670–740 (good), 740–850 (excellent)]
 FICO_BINS = [300, 580, 670, 740, 850]
 FICO_LABELS = [0, 1, 2, 3]
+
+# Employment length bins: [0–1 (new), 1–3 (early), 3–7 (mid), 7+ (senior)]
+EMP_LENGTH_BINS = [0, 1, 3, 7, 50]
+EMP_LENGTH_LABELS = [0, 1, 2, 3]
+
+# Sub-grade ordinal mapping: A1=1, A2=2, ..., G5=35
+SUB_GRADE_ORDER = {f'{g}{n}': i * 5 + n for i, g in enumerate('ABCDEFG') for n in range(1, 6)}
+
+# Verification status ordinal mapping
+VERIFICATION_MAP = {'Not Verified': 0, 'Source Verified': 1, 'Verified': 2}
 
 # XGBoost hyperparameters
 XGBOOST_PARAMS = {
@@ -295,7 +318,7 @@ RISK_LABELS = ['Low', 'Medium', 'High', 'Critical']
 # ─────────────────────────────────────────────────────────
 # Optuna Hyperparameter Tuning
 # ─────────────────────────────────────────────────────────
-OPTUNA_N_TRIALS = 50
+OPTUNA_N_TRIALS = 75
 OPTUNA_PARAM_SPACE = {
     'max_depth': (3, 10),
     'learning_rate': (0.01, 0.3),

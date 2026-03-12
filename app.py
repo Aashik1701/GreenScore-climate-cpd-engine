@@ -31,11 +31,11 @@ logger = logging.getLogger(__name__)
 # ── Page Config ──
 st.set_page_config(
     page_title="GreenScore CPD Engine",
-    page_icon="🌍",
+    page_icon="GS",
     layout="wide",
 )
 
-st.title("🌍 GreenScore: Climate-Adjusted Probability of Default")
+st.title("GreenScore: Climate-Adjusted Probability of Default")
 st.caption("B2B SaaS | RBI Disclosure Aligned | NGFS Phase V Scenarios")
 
 # ─────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ REQUIRED_COLS = ['dti', 'annual_inc', 'fico_range_low', 'int_rate', 'installment
 OPTIONAL_COLS = ['addr_state', 'purpose', 'loan_amnt']
 
 with st.sidebar:
-    st.header("⚙️ Scenario Settings")
+    st.header("Scenario Settings")
     scenario = st.selectbox(
         "NGFS Carbon Price Scenario",
         list(config.CARBON_PRICES.keys()),
@@ -56,9 +56,9 @@ with st.sidebar:
     st.metric("Carbon Price (2030)", f"${carbon_price}/tCO₂")
 
     st.markdown("---")
-    st.subheader("📁 Dataset Source")
+    st.subheader("Dataset Source")
     dataset_options = {k: v['label'] for k, v in DATASET_REGISTRY.items()}
-    dataset_options['custom'] = '📂 Custom Upload'
+    dataset_options['custom'] = 'Custom Upload'
     dataset_choice = st.selectbox(
         "Select Dataset",
         list(dataset_options.keys()),
@@ -67,7 +67,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.subheader("🎚️ Sensitivity Analysis")
+    st.subheader("Sensitivity Analysis")
     severity_factor = st.slider(
         "Physical Risk Severity Factor",
         min_value=0.1, max_value=0.5, value=config.SEVERITY_FACTOR, step=0.05,
@@ -84,7 +84,7 @@ with st.sidebar:
     st.markdown("**Climate**: NASA POWER API + NGFS Phase V")
     st.markdown("**Regulatory**: RBI Climate Risk Framework 2024")
     st.markdown("---")
-    st.markdown("### 📚 References")
+    st.markdown("### References")
     st.markdown("- Bell & van Vuuren (2022)")
     st.markdown("- Bouchet, Dayan & Contoux (2022)")
     st.markdown("- NGFS Phase V Scenarios (2025)")
@@ -126,7 +126,7 @@ df = None
 
 if dataset_choice == 'custom':
     uploaded = st.file_uploader(
-        "📂 Upload Loan Portfolio (CSV)",
+        "Upload Loan Portfolio (CSV)",
         type=['csv'],
         help=f"Required: {', '.join(REQUIRED_COLS)}. Optional: {', '.join(OPTIONAL_COLS)}",
     )
@@ -136,7 +136,7 @@ else:
     ds_info = DATASET_REGISTRY[dataset_choice]
     ds_path = ds_info['path']
     if not os.path.exists(ds_path):
-        st.error(f"❌ Dataset file not found: `{ds_path}`. Please download it first (see README).")
+        st.error(f"Dataset file not found: `{ds_path}`. Please download it first (see README).")
         st.stop()
 
     @st.cache_data(show_spinner=f"Loading {ds_info['label']}…")
@@ -148,7 +148,7 @@ else:
             return load_data(path, nrows=nrows)
 
     df = _load_builtin(dataset_choice, ds_path)
-    st.success(f"✅ Loaded **{ds_info['label']}** — {len(df):,} loans")
+    st.success(f"Loaded **{ds_info['label']}** — {len(df):,} loans")
 
 if df is not None:
 
@@ -156,11 +156,11 @@ if df is not None:
     if dataset_choice == 'custom':
         missing = [c for c in REQUIRED_COLS if c not in df.columns]
         if missing:
-            st.error(f"❌ **Missing required columns:** {', '.join(missing)}")
+            st.error(f"**Missing required columns:** {', '.join(missing)}")
             st.markdown("Your CSV must contain these columns:")
             for col in REQUIRED_COLS:
-                icon = "✅" if col in df.columns else "❌"
-                st.markdown(f"  {icon} `{col}`")
+                status = "Present" if col in df.columns else "Missing"
+                st.markdown(f"  - `{col}` — {status}")
             st.stop()
 
     # Clean numeric types (safe for all sources)
@@ -173,23 +173,23 @@ if df is not None:
         df['emp_length'] = df['emp_length'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
 
     # Enrich with climate features (NASA POWER + NGFS)
-    with st.spinner("🌍 Enriching with climate features (NASA POWER + NGFS)..."):
+    with st.spinner("Enriching with climate features..."):
         df = add_climate_features(df)
 
-    st.success(f"✅ Loaded {len(df):,} loans — climate features added")
+    st.success(f"Loaded {len(df):,} loans — climate features added")
 
-    with st.expander("📋 Preview Raw Data"):
+    with st.expander("Preview Raw Data"):
         st.dataframe(df.head(20), use_container_width=True)
 
     # ── Load Model ──
     try:
         model = joblib.load('models/baseline_pd_model.pkl')
     except FileNotFoundError:
-        st.error("⚠️ Model not trained yet. Run `python3 cpd_engine.py` first.")
+        st.error("Model not trained yet. Run `python3 cpd_engine.py` first.")
         st.stop()
 
     # ── Compute CPD ──
-    with st.spinner("🔄 Computing Climate-Adjusted PDs…"):
+    with st.spinner("Computing Climate-Adjusted PDs…"):
         baseline_pd, cpd = compute_cpd(df, model, scenario, severity_factor, transition_scaling)
 
         df['Baseline_PD'] = baseline_pd
@@ -203,7 +203,7 @@ if df is not None:
     # TABS
     # ═══════════════════════════════════════════════
     tab_overview, tab_compare, tab_map, tab_sector, tab_shap, tab_top20, tab_results = st.tabs([
-        "📊 Overview", "🔀 Multi-Scenario", "🗺️ Heatmap", "🏭 Sectors", "🔍 SHAP", "🔝 Top 20 Risk", "📋 Results",
+        "Overview", "Multi-Scenario", "Heatmap", "Sectors", "SHAP", "Top 20 Risk", "Results",
     ])
 
     # ── TAB 1: Overview ──
@@ -247,7 +247,7 @@ if df is not None:
 
     # ── TAB 2: Multi-Scenario Comparison ──
     with tab_compare:
-        st.subheader("🔀 Multi-Scenario Comparison")
+        st.subheader("Multi-Scenario Comparison")
         st.markdown("Side-by-side CPD analysis across all three NGFS scenarios.")
 
         scenario_results = {}
@@ -285,7 +285,7 @@ if df is not None:
 
     # ── TAB 3: Geographic Heatmap ──
     with tab_map:
-        st.subheader("🗺️ Geographic Climate Risk Heatmap")
+        st.subheader("Geographic Climate Risk Heatmap")
         loc_col = 'addr_state' if 'addr_state' in df.columns else None
         if loc_col:
             state_risk = df.groupby(loc_col)['CPD_2030'].mean().reset_index()
@@ -329,7 +329,7 @@ if df is not None:
 
     # ── TAB 4: Sector Analysis ──
     with tab_sector:
-        st.subheader("🏭 Sector-wise Climate Exposure")
+        st.subheader("Sector-wise Climate Exposure")
         purpose_col = 'purpose' if 'purpose' in df.columns else None
         if purpose_col:
             sector_df = df.groupby(purpose_col).agg(
@@ -352,7 +352,7 @@ if df is not None:
 
     # ── TAB 5: SHAP Explainability ──
     with tab_shap:
-        st.subheader("🔍 SHAP Feature Explanations")
+        st.subheader("SHAP Feature Explanations")
         st.markdown(
             "SHAP (SHapley Additive exPlanations) values show **how each feature "
             "contributes to individual predictions**. Red = pushes PD higher, Blue = pushes PD lower."
@@ -379,7 +379,7 @@ if df is not None:
 
             # Live SHAP for a single loan
             st.markdown("---")
-            st.markdown("#### 🔬 Explain a Single Loan")
+            st.markdown("#### Explain a Single Loan")
             loan_idx = st.number_input(
                 "Select loan index to explain",
                 min_value=0, max_value=len(df) - 1, value=0, step=1,
@@ -421,13 +421,13 @@ if df is not None:
                 st.warning(f"Live SHAP explanation unavailable: {e}")
         else:
             st.warning(
-                "⚠️ SHAP plots not found. Retrain the model with:\n\n"
+                "SHAP plots not found. Retrain the model with:\n\n"
                 "```bash\npython3 cpd_engine.py data/accepted_2007_to_2018Q4.csv 500000 --tune\n```"
             )
 
     # ── TAB 6: Top 20 Riskiest Loans ──
     with tab_top20:
-        st.subheader("🔝 Top 20 Riskiest Loans")
+        st.subheader("Top 20 Riskiest Loans")
         top_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose', 'annual_inc',
                                 'fico_range_low', 'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
                     if c in df.columns]
@@ -439,7 +439,7 @@ if df is not None:
 
     # ── TAB 7: Full Results ──
     with tab_results:
-        st.subheader("📋 Loan-Level CPD Results")
+        st.subheader("Loan-Level CPD Results")
         display_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose',
                                     'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
                         if c in df.columns]
@@ -449,13 +449,13 @@ if df is not None:
     # EXPORTS
     # ═══════════════════════════════════════════════
     st.markdown("---")
-    st.subheader("⬇️ Export Results")
+    st.subheader("Export Results")
     col_a, col_b = st.columns(2)
 
     with col_a:
         csv_data = df[display_cols].to_csv(index=False)
         st.download_button(
-            "📥 Download Results CSV", csv_data,
+            "Download Results CSV", csv_data,
             "cpd_results.csv", "text/csv", use_container_width=True,
         )
 
@@ -463,21 +463,21 @@ if df is not None:
         # Pre-generate PDF to fix two-click bug
         pdf_bytes = generate_pdf_report(df, scenario, baseline_pd.mean(), cpd.mean())
         st.download_button(
-            "📄 Download RBI Disclosure PDF", pdf_bytes,
+            "Download RBI Disclosure PDF", pdf_bytes,
             "rbi_climate_disclosure.pdf", "application/pdf", use_container_width=True,
         )
 
 else:
     # ── Landing State ──
-    st.info("👆 Upload a loan portfolio CSV to begin analysis")
+    st.info("Upload a loan portfolio CSV to begin analysis.")
     st.markdown("---")
-    st.markdown("### 📐 CPD Formula")
+    st.markdown("### CPD Formula")
     st.latex(r"CPD = PD_{\text{baseline}} \times (1 + \alpha_{\text{physical}}) \times (1 + \alpha_{\text{transition}})")
 
-    st.markdown("### 📌 Expected CSV Columns")
+    st.markdown("### Expected CSV Columns")
     col_info = pd.DataFrame({
         'Column': REQUIRED_COLS + OPTIONAL_COLS,
-        'Required': ['✅'] * len(REQUIRED_COLS) + ['Optional'] * len(OPTIONAL_COLS),
+        'Required': ['Yes'] * len(REQUIRED_COLS) + ['Optional'] * len(OPTIONAL_COLS),
         'Description': [
             'Debt-to-Income ratio', 'Annual income ($)', 'FICO credit score',
             'Interest rate (%)', 'Monthly installment ($)', 'Employment length',
@@ -486,14 +486,14 @@ else:
     })
     st.dataframe(col_info, hide_index=True, use_container_width=True)
 
-    st.markdown("### 🔬 How It Works")
+    st.markdown("### How It Works")
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown("**1️⃣ Baseline PD**")
+        st.markdown("**1. Baseline PD**")
         st.markdown("XGBoost classifier trained on historical loan performance data.")
     with col2:
-        st.markdown("**2️⃣ Physical Risk**")
+        st.markdown("**2. Physical Risk**")
         st.markdown("State-level flood, cyclone, and heat hazard scores (IMD/NDMA/FEMA).")
     with col3:
-        st.markdown("**3️⃣ Transition Risk**")
+        st.markdown("**3. Transition Risk**")
         st.markdown("NGFS Phase V carbon price × sector emission intensity → carbon cost burden.")
