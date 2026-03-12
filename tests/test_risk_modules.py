@@ -446,24 +446,31 @@ class TestClimateFeatureConfig:
 # ─────────────────────────────────────────────────────────
 
 class TestFeatureEngineering:
-    """Tests for Phase 1.3 feature engineering additions."""
+    """Tests for Phase 1.3 + 1.8 feature engineering additions."""
 
     def test_new_raw_cols_in_config(self):
         """New raw columns should be in RAW_COLS."""
         for col in ['revol_util', 'revol_bal', 'open_acc', 'total_acc',
-                     'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term']:
+                     'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term',
+                     'acc_open_past_24mths', 'mort_acc', 'total_bc_limit',
+                     'bc_util', 'percent_bc_gt_75', 'mths_since_recent_inq']:
             assert col in config.RAW_COLS, f"{col} missing from RAW_COLS"
 
     def test_new_base_features_in_config(self):
         """New base features should be in BASE_FEATURES."""
         for feat in ['revol_util', 'revol_bal', 'open_acc', 'total_acc',
-                      'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term_months', 'loan_amnt']:
+                      'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term_months', 'loan_amnt',
+                      'acc_open_past_24mths', 'mort_acc', 'total_bc_limit',
+                      'total_rev_hi_lim', 'mo_sin_rcnt_tl', 'mo_sin_old_rev_tl_op',
+                      'num_actv_rev_tl', 'percent_bc_gt_75', 'bc_util',
+                      'mths_since_recent_inq']:
             assert feat in config.BASE_FEATURES, f"{feat} missing from BASE_FEATURES"
 
     def test_new_engineered_features_in_config(self):
         """New engineered features should be in ENGINEERED_FEATURES."""
         for feat in ['monthly_payment_burden',
-                      'credit_utilization_ratio', 'open_to_total_acc']:
+                      'credit_utilization_ratio', 'open_to_total_acc',
+                      'bc_limit_to_income', 'rev_limit_to_income', 'recent_accts_ratio']:
             assert feat in config.ENGINEERED_FEATURES, f"{feat} missing from ENGINEERED_FEATURES"
 
     def test_all_features_length(self):
@@ -499,3 +506,48 @@ class TestFeatureEngineering:
         df_copy['credit_utilization_ratio'] = df_copy['revol_bal'] / (df_copy['annual_inc'] + 1)
         assert abs(df_copy['monthly_payment_burden'].iloc[0] - 500 / (60000 / 12 + 1)) < 0.001
         assert df_copy['sub_grade_num'].iloc[0] == 18
+
+
+# ─────────────────────────────────────────────────────────
+# Cross-Dataset Validation Tests (Phase 6.3)
+# ─────────────────────────────────────────────────────────
+
+class TestCrossDatasetValidation:
+    """Tests for the cross-dataset validation function."""
+
+    def test_cross_validate_returns_required_keys(self):
+        """cross_dataset_validate should return dict with expected keys."""
+        from cpd_engine import cross_dataset_validate
+        model_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'baseline_pd_model.pkl',
+        )
+        if not os.path.exists(model_path):
+            pytest.skip("Trained model not available")
+        hc_path = os.path.join(
+            os.path.dirname(__file__), '..', 'data',
+            'home-credit-default-risk', 'application_train.csv',
+        )
+        if not os.path.exists(hc_path):
+            pytest.skip("Home Credit dataset not available")
+        results = cross_dataset_validate(model_path=model_path)
+        assert 'auc' in results
+        assert 'n_records' in results
+        assert 'default_rate' in results
+        assert results['n_records'] > 0
+
+    def test_cross_validate_auc_above_random(self):
+        """Cross-dataset AUC should be above random chance (0.5)."""
+        from cpd_engine import cross_dataset_validate
+        model_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'baseline_pd_model.pkl',
+        )
+        if not os.path.exists(model_path):
+            pytest.skip("Trained model not available")
+        hc_path = os.path.join(
+            os.path.dirname(__file__), '..', 'data',
+            'home-credit-default-risk', 'application_train.csv',
+        )
+        if not os.path.exists(hc_path):
+            pytest.skip("Home Credit dataset not available")
+        results = cross_dataset_validate(model_path=model_path)
+        assert results['auc'] > 0.50, f"AUC {results['auc']:.4f} not above random"

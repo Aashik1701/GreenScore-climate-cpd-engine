@@ -288,13 +288,16 @@ def generate_pdf_report(
     story.append(Paragraph("8. Methodology", styles['Heading2']))
     story.append(Paragraph(
         "CPD = Baseline_PD × (1 + Physical_Risk_Factor) × (1 + Transition_Risk_Factor). "
-        "Baseline PD via XGBoost trained on financial + climate features. "
+        "Baseline PD via XGBoost (Optuna-tuned, 25 financial features) trained on "
+        "LendingClub data with scale_pos_weight for class-imbalance handling. "
         "Physical risk: NASA POWER API — monthly temperature &amp; precipitation data "
         "engineered into flood frequency, drought severity, temperature anomaly, "
-        "and extreme weather event features (severity factor = 0.3). "
-        "Transition risk: NGFS Phase V carbon price × CPCB sector emissions (scaling = 0.4). "
-        "Climate features are fed directly into the XGBoost model alongside "
-        "borrower financials, enabling the model to learn climate-risk patterns.",
+        "and extreme weather event features, applied as a post-prediction "
+        "multiplicative overlay (severity factor = 0.3, per Bell &amp; van Vuuren 2022). "
+        "Transition risk: NGFS Phase V carbon price × CPCB/IEA sector emission intensities, "
+        "converted to a PD uplift via scaling factor = 0.4. "
+        "The two-stage architecture separates financial PD estimation from "
+        "climate risk adjustments, enabling scenario-based what-if analysis.",
         styles['SmallNormal'],
     ))
     story.append(Spacer(1, 10))

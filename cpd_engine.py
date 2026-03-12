@@ -100,6 +100,15 @@ def load_data(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
         (pd.Timestamp('2018-01-01') - df['earliest_cr_line']).dt.days / 30.44
     ).fillna(180)
 
+    # ── Phase 1.8: Clean credit bureau depth columns ──
+    for col in [
+        'acc_open_past_24mths', 'mort_acc', 'total_bc_limit',
+        'total_rev_hi_lim', 'mo_sin_rcnt_tl', 'mo_sin_old_rev_tl_op',
+        'num_actv_rev_tl', 'percent_bc_gt_75', 'bc_util',
+        'mths_since_recent_inq',
+    ]:
+        df[col] = pd.to_numeric(df.get(col, 0), errors='coerce').fillna(0)
+
     # ── Feature Engineering (original) ──
     df['income_to_installment'] = df['annual_inc'] / (df['installment'] * 12 + 1)
     df['loan_to_income'] = df['loan_amnt'] / (df['annual_inc'] + 1)
@@ -115,6 +124,11 @@ def load_data(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
     df['monthly_payment_burden'] = df['installment'] / (df['annual_inc'] / 12 + 1)
     df['credit_utilization_ratio'] = df['revol_bal'] / (df['annual_inc'] + 1)
     df['open_to_total_acc'] = df['open_acc'] / (df['total_acc'] + 1)
+
+    # ── Phase 1.8: Bureau-depth ratios ──
+    df['bc_limit_to_income'] = df['total_bc_limit'] / (df['annual_inc'] + 1)
+    df['rev_limit_to_income'] = df['total_rev_hi_lim'] / (df['annual_inc'] + 1)
+    df['recent_accts_ratio'] = df['acc_open_past_24mths'] / (df['total_acc'] + 1)
 
     logger.info(
         "Loaded %s records. Default rate: %.3f",
@@ -469,6 +483,12 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
         ('inq_last_6mths', 0), ('loan_amnt', 0), ('term_months', 36),
         ('sub_grade_num', 18), ('verification_num', 0),
         ('credit_history_months', 180),
+        # Phase 1.8 — credit bureau depth defaults
+        ('acc_open_past_24mths', 0), ('mort_acc', 0),
+        ('total_bc_limit', 0), ('total_rev_hi_lim', 0),
+        ('mo_sin_rcnt_tl', 12), ('mo_sin_old_rev_tl_op', 180),
+        ('num_actv_rev_tl', 0), ('percent_bc_gt_75', 0),
+        ('bc_util', 0), ('mths_since_recent_inq', 12),
     ]:
         if col not in df.columns:
             df[col] = default
@@ -481,6 +501,14 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
     if 'open_to_total_acc' not in df.columns:
         df['open_to_total_acc'] = df.get('open_acc', 0) / (df.get('total_acc', 0) + 1)
 
+    # ── Phase 1.8: Ensure bureau-depth ratios exist ──
+    if 'bc_limit_to_income' not in df.columns:
+        df['bc_limit_to_income'] = df.get('total_bc_limit', 0) / (df['annual_inc'] + 1)
+    if 'rev_limit_to_income' not in df.columns:
+        df['rev_limit_to_income'] = df.get('total_rev_hi_lim', 0) / (df['annual_inc'] + 1)
+    if 'recent_accts_ratio' not in df.columns:
+        df['recent_accts_ratio'] = df.get('acc_open_past_24mths', 0) / (df.get('total_acc', 0) + 1)
+
     # Use financial features only — climate adjustments are post-prediction
     feature_cols = config.ALL_FEATURES
 
@@ -489,27 +517,134 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────
+# Cross-Dataset Validation (Phase 6.3)
+# ─────────────────────────────────────────────────────────
+
+def cross_dataset_validate(
+    model_path: str = 'models/baseline_pd_model.pkl',
+    save_dir: str = 'models',
+) -> dict:
+    """
+    Validate the LendingClub-trained PD model on the Home Credit dataset
+    to test cross-dataset generalisation.
+
+    Returns dict with AUC, classification report, and sample statistics.
+    """
+    from dataset_adapters import adapt_home_credit
+
+    logger.info("Loading saved model from %s", model_path)
+    model = joblib.load(model_path)
+
+    logger.info("Adapting Home Credit dataset…")
+    df = adapt_home_credit()
+
+    y_true = df['default'].values
+    logger.info(
+        "Home Credit: %s records, default rate %.3f",
+        f"{len(df):,}", y_true.mean(),
+    )
+
+    # Predict using the LendingClub-trained model
+    y_prob = get_baseline_pd(model, df)
+
+    # AUC
+    auc = roc_auc_score(y_true, y_prob)
+    logger.info("Cross-dataset AUC: %.4f", auc)
+
+    # Classification report at 0.5 threshold
+    y_pred_50 = (y_prob >= 0.5).astype(int)
+    report_50 = classification_report(
+        y_true, y_pred_50, target_names=['Paid', 'Default'], zero_division=0,
+    )
+
+    # Also evaluate at a threshold matching the default rate (more balanced)
+    threshold_balanced = np.percentile(y_prob, 100 * (1 - y_true.mean()))
+    y_pred_bal = (y_prob >= threshold_balanced).astype(int)
+    report_bal = classification_report(
+        y_true, y_pred_bal, target_names=['Paid', 'Default'], zero_division=0,
+    )
+
+    # Save report
+    report_path = os.path.join(save_dir, 'cross_dataset_validation.txt')
+    with open(report_path, 'w') as f:
+        f.write("GreenScore — Cross-Dataset Validation Report\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Training dataset:    LendingClub (US consumer loans)\n")
+        f.write(f"Validation dataset:  Home Credit Default Risk\n")
+        f.write(f"Validation records:  {len(df):,}\n")
+        f.write(f"Validation default rate: {y_true.mean():.4f}\n\n")
+        f.write(f"Cross-Dataset AUC: {auc:.4f}\n\n")
+        f.write(f"Classification Report (threshold=0.50):\n{report_50}\n")
+        f.write(f"Classification Report (threshold={threshold_balanced:.3f} — "
+                f"matched to default rate):\n{report_bal}\n")
+    logger.info("Validation report saved to %s", report_path)
+
+    # Save ROC curve
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        RocCurveDisplay.from_predictions(
+            y_true, y_prob, name='XGBoost (cross-dataset)', ax=ax,
+        )
+        ax.set_title(f'Cross-Dataset ROC — Home Credit (AUC={auc:.4f})')
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Random')
+        ax.legend()
+        plt.tight_layout()
+        fig.savefig(
+            os.path.join(save_dir, 'cross_dataset_roc.png'),
+            dpi=150, bbox_inches='tight',
+        )
+        plt.close(fig)
+        logger.info("ROC curve saved to %s/cross_dataset_roc.png", save_dir)
+    except Exception as e:
+        logger.warning("Could not save ROC curve: %s", e)
+
+    return {
+        'auc': auc,
+        'n_records': len(df),
+        'default_rate': float(y_true.mean()),
+        'threshold_balanced': float(threshold_balanced),
+        'report_path': report_path,
+    }
+
+
+# ─────────────────────────────────────────────────────────
 # CLI Entry Point
 # ─────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    path = sys.argv[1] if len(sys.argv) > 1 else 'data/accepted_2007_to_2018Q4.csv'
-    nrows = int(sys.argv[2]) if len(sys.argv) > 2 else 200_000
-    do_tune = '--tune' in sys.argv
-    print(f"Loading data from {path} ({nrows} rows)…")
-    if do_tune:
-        print(f"Optuna tuning enabled ({config.OPTUNA_N_TRIALS} trials)")
-    df = load_data(path, nrows=nrows)
-    print("Adding climate features (NASA POWER + NGFS)…")
-    df = add_climate_features(df)
-    model, results = train_baseline_pd(df, tune=do_tune)
-    print("\n═══ Model Comparison ═══")
-    print(f"  XGBoost AUC (hold-out):   {results['xgboost_auc']:.4f}")
-    print(f"  XGBoost AUC (5-fold CV):  {results['xgboost_cv_mean']:.4f} ± {results['xgboost_cv_std']:.4f}")
-    print(f"  Logistic Regression AUC:  {results['logistic_regression_auc']:.4f}")
-    print(f"  Random Forest AUC:        {results['random_forest_auc']:.4f}")
-    print(f"  LightGBM AUC:             {results['lightgbm_auc']:.4f}")
-    print(f"  Scale Pos Weight:         {results['scale_pos_weight']:.2f}")
-    if results['tuned']:
-        print("  Optuna Tuning:            ✅ Applied")
-    print(f"\nModel + plots + SHAP saved to models/")
+    if '--validate' in sys.argv:
+        # Cross-dataset validation mode
+        print("Running cross-dataset validation on Home Credit…")
+        results = cross_dataset_validate()
+        print(f"\n═══ Cross-Dataset Validation ═══")
+        print(f"  Dataset:       Home Credit Default Risk")
+        print(f"  Records:       {results['n_records']:,}")
+        print(f"  Default Rate:  {results['default_rate']:.4f}")
+        print(f"  AUC:           {results['auc']:.4f}")
+        print(f"\n  Full report:   {results['report_path']}")
+    else:
+        positional = [a for a in sys.argv[1:] if not a.startswith('--')]
+        path = positional[0] if len(positional) > 0 else 'data/accepted_2007_to_2018Q4.csv'
+        nrows = int(positional[1]) if len(positional) > 1 else 500_000
+        do_tune = '--tune' in sys.argv
+        print(f"Loading data from {path} ({nrows} rows)…")
+        if do_tune:
+            print(f"Optuna tuning enabled ({config.OPTUNA_N_TRIALS} trials)")
+        df = load_data(path, nrows=nrows)
+        print("Adding climate features (NASA POWER + NGFS)…")
+        df = add_climate_features(df)
+        model, results = train_baseline_pd(df, tune=do_tune)
+        print("\n═══ Model Comparison ═══")
+        print(f"  XGBoost AUC (hold-out):   {results['xgboost_auc']:.4f}")
+        print(f"  XGBoost AUC (5-fold CV):  {results['xgboost_cv_mean']:.4f} ± {results['xgboost_cv_std']:.4f}")
+        print(f"  Logistic Regression AUC:  {results['logistic_regression_auc']:.4f}")
+        print(f"  Random Forest AUC:        {results['random_forest_auc']:.4f}")
+        print(f"  LightGBM AUC:             {results['lightgbm_auc']:.4f}")
+        print(f"  Scale Pos Weight:         {results['scale_pos_weight']:.2f}")
+        if results['tuned']:
+            print("  Optuna Tuning:            ✅ Applied")
+        print(f"\nModel + plots + SHAP saved to models/")

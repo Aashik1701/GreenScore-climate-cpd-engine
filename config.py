@@ -25,6 +25,11 @@ RAW_COLS = [
     'revol_util', 'revol_bal', 'open_acc', 'total_acc',
     'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'term',
     'sub_grade', 'verification_status', 'earliest_cr_line',
+    # Phase 1.8 — high-correlation features for AUC improvement
+    'acc_open_past_24mths', 'mort_acc', 'total_bc_limit',
+    'total_rev_hi_lim', 'mo_sin_rcnt_tl', 'mo_sin_old_rev_tl_op',
+    'num_actv_rev_tl', 'percent_bc_gt_75', 'bc_util',
+    'mths_since_recent_inq',
 ]
 
 BASE_FEATURES = [
@@ -35,6 +40,11 @@ BASE_FEATURES = [
     'pub_rec', 'delinq_2yrs', 'inq_last_6mths', 'loan_amnt',
     'term_months', 'sub_grade_num', 'verification_num',
     'credit_history_months',
+    # Phase 1.8 — credit bureau depth features
+    'acc_open_past_24mths', 'mort_acc', 'total_bc_limit',
+    'total_rev_hi_lim', 'mo_sin_rcnt_tl', 'mo_sin_old_rev_tl_op',
+    'num_actv_rev_tl', 'percent_bc_gt_75', 'bc_util',
+    'mths_since_recent_inq',
 ]
 
 ENGINEERED_FEATURES = [
@@ -46,6 +56,10 @@ ENGINEERED_FEATURES = [
     'monthly_payment_burden',  # installment / (annual_inc / 12 + 1)
     'credit_utilization_ratio', # revol_bal / (annual_inc + 1)
     'open_to_total_acc',       # open_acc / (total_acc + 1)
+    # Phase 1.8 — bureau-depth ratios
+    'bc_limit_to_income',      # total_bc_limit / (annual_inc + 1)
+    'rev_limit_to_income',     # total_rev_hi_lim / (annual_inc + 1)
+    'recent_accts_ratio',      # acc_open_past_24mths / (total_acc + 1)
 ]
 
 ALL_FEATURES = BASE_FEATURES + ENGINEERED_FEATURES

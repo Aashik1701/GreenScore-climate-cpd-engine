@@ -1,0 +1,30 @@
+GreenScore — Cross-Dataset Validation Report
+==================================================
+
+Training dataset:    LendingClub (US consumer loans)
+Validation dataset:  Home Credit Default Risk
+Validation records:  307,511
+Validation default rate: 0.0807
+
+Cross-Dataset AUC: 0.5321
+
+Classification Report (threshold=0.50):
+              precision    recall  f1-score   support
+
+        Paid       0.96      0.01      0.03    282686
+     Default       0.08      0.99      0.15     24825
+
+    accuracy                           0.09    307511
+   macro avg       0.52      0.50      0.09    307511
+weighted avg       0.89      0.09      0.04    307511
+
+Classification Report (threshold=0.691 — matched to default rate):
+              precision    recall  f1-score   support
+
+        Paid       0.92      0.92      0.92    282686
+     Default       0.09      0.09      0.09     24825
+
+    accuracy                           0.85    307511
+   macro avg       0.50      0.50      0.50    307511
+weighted avg       0.85      0.85      0.85    307511
+
