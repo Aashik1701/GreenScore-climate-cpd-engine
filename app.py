@@ -28,6 +28,23 @@ from dataset_adapters import DATASET_REGISTRY, adapt_home_credit, adapt_indian_b
 
 logger = logging.getLogger(__name__)
 
+
+# ── Theme-aware Plotly template ──
+def _plotly_template():
+    """Return Plotly template matching the current Streamlit theme."""
+    try:
+        theme = st.get_option('theme.base')
+    except Exception:
+        theme = None
+    return 'plotly_dark' if theme == 'dark' else 'plotly_white'
+
+
+# ── Cached SHAP explainer ──
+@st.cache_resource
+def _get_shap_explainer(_model):
+    import shap
+    return shap.TreeExplainer(_model)
+
 # ── Page Config ──
 st.set_page_config(
     page_title="GreenScore CPD Engine",
@@ -68,6 +85,11 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Sensitivity Analysis")
+    sample_size = st.slider(
+        "Dataset Sample Size (rows)",
+        min_value=10000, max_value=200000, value=50000, step=10000,
+        help="Number of rows loaded from built-in datasets. Higher = slower but more representative.",
+    )
     severity_factor = st.slider(
         "Physical Risk Severity Factor",
         min_value=0.1, max_value=0.5, value=config.SEVERITY_FACTOR, step=0.05,
@@ -147,8 +169,7 @@ else:
             from cpd_engine import load_data
             return load_data(path, nrows=nrows)
 
-    df = _load_builtin(dataset_choice, ds_path)
-    st.success(f"Loaded **{ds_info['label']}** — {len(df):,} loans")
+    df = _load_builtin(dataset_choice, ds_path, nrows=sample_size)
 
 if df is not None:
 
@@ -187,6 +208,9 @@ if df is not None:
     except FileNotFoundError:
         st.error("Model not trained yet. Run `python3 cpd_engine.py` first.")
         st.stop()
+    except Exception as e:
+        st.error(f"Failed to load model (file may be corrupted): {e}")
+        st.stop()
 
     # ── Compute CPD ──
     with st.spinner("Computing Climate-Adjusted PDs…"):
@@ -202,8 +226,9 @@ if df is not None:
     # ═══════════════════════════════════════════════
     # TABS
     # ═══════════════════════════════════════════════
-    tab_overview, tab_compare, tab_map, tab_sector, tab_shap, tab_top20, tab_results = st.tabs([
-        "Overview", "Multi-Scenario", "Heatmap", "Sectors", "SHAP", "Top 20 Risk", "Results",
+    tab_overview, tab_compare, tab_map, tab_sector, tab_shap, tab_top20, tab_el, tab_proj, tab_stress, tab_results = st.tabs([
+        "Overview", "Multi-Scenario", "Heatmap", "Sectors", "SHAP", "Top 20 Risk",
+        "Expected Loss", "Projections", "Stress Test", "Results",
     ])
 
     # ── TAB 1: Overview ──
@@ -228,7 +253,7 @@ if df is not None:
         fig_hist.update_layout(
             title='Baseline PD vs Climate-Adjusted PD',
             xaxis_title='Probability of Default', yaxis_title='Count',
-            barmode='overlay', template='plotly_dark',
+            barmode='overlay', template=_plotly_template(),
             height=400,
         )
         st.plotly_chart(fig_hist, use_container_width=True)
@@ -242,7 +267,7 @@ if df is not None:
             color='Category', color_discrete_map=color_map,
             hole=0.45, title='Risk Category Distribution',
         )
-        fig_donut.update_layout(template='plotly_dark', height=400)
+        fig_donut.update_layout(template=_plotly_template(), height=400)
         st.plotly_chart(fig_donut, use_container_width=True)
 
     # ── TAB 2: Multi-Scenario Comparison ──
@@ -252,9 +277,13 @@ if df is not None:
 
         scenario_results = {}
         sc_names = list(config.CARBON_PRICES.keys())
-        for sc_name in sc_names:
-            _, sc_cpd = compute_cpd(df, model, sc_name, severity_factor, transition_scaling)
-            scenario_results[sc_name] = sc_cpd
+        with st.spinner("Computing all scenarios…"):
+            for sc_name in sc_names:
+                if sc_name == scenario:
+                    scenario_results[sc_name] = cpd  # reuse already-computed CPD
+                else:
+                    _, sc_cpd = compute_cpd(df, model, sc_name, severity_factor, transition_scaling)
+                    scenario_results[sc_name] = sc_cpd
 
         # Metrics row
         cols = st.columns(len(sc_names))
@@ -279,7 +308,7 @@ if df is not None:
         fig_compare.update_layout(
             title='CPD Distribution Across NGFS Scenarios',
             xaxis_title='Climate-Adjusted PD', yaxis_title='Count',
-            barmode='overlay', template='plotly_dark', height=400,
+            barmode='overlay', template=_plotly_template(), height=400,
         )
         st.plotly_chart(fig_compare, use_container_width=True)
 
@@ -323,7 +352,7 @@ if df is not None:
                     tooltip=f"{state}: {cpd_val:.4f}",
                 ).add_to(m)
 
-            st_folium(m, width=800, height=500)
+            st_folium(m, use_container_width=True, height=500)
         else:
             st.info("No `addr_state` column found. Upload data with state codes for the heatmap.")
 
@@ -344,7 +373,7 @@ if df is not None:
                 barmode='group', title='Sector: Baseline PD vs CPD 2030',
                 color_discrete_sequence=['steelblue', 'crimson'],
             )
-            fig_sector.update_layout(template='plotly_dark', height=400)
+            fig_sector.update_layout(template=_plotly_template(), height=400)
             st.plotly_chart(fig_sector, use_container_width=True)
             st.dataframe(sector_df, use_container_width=True)
         else:
@@ -398,7 +427,7 @@ if df is not None:
                         X_sample[feat] = 0
                 X_sample = X_sample.fillna(X_sample.median())
 
-                explainer = shap.TreeExplainer(model)
+                explainer = _get_shap_explainer(model)
                 shap_vals = explainer(X_sample)
 
                 # Build a waterfall-style table (Streamlit-friendly)
@@ -437,12 +466,212 @@ if df is not None:
             use_container_width=True,
         )
 
+    # ── TAB 7: Portfolio Expected Loss ──
+    with tab_el:
+        st.subheader("Portfolio Expected Loss")
+        st.markdown(
+            "**Expected Loss = CPD × LGD × EAD** — translates climate-adjusted default "
+            "probability into estimated dollar losses."
+        )
+
+        lgd = st.slider(
+            "Loss Given Default (LGD)",
+            min_value=0.20, max_value=0.80, value=config.DEFAULT_LGD, step=0.05,
+            help="Basel II unsecured consumer default: 0.45. Secured mortgages: ~0.25.",
+        )
+
+        # EAD = loan_amnt if available, else use installment * 36 as proxy
+        if 'loan_amnt' in df.columns:
+            df['EAD'] = df['loan_amnt']
+        else:
+            df['EAD'] = df['installment'] * 36
+
+        df['Expected_Loss'] = df['CPD_2030'] * lgd * df['EAD']
+
+        total_el = df['Expected_Loss'].sum()
+        total_ead = df['EAD'].sum()
+        avg_el_rate = total_el / (total_ead + 1e-8)
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Portfolio EAD", f"${total_ead:,.0f}")
+        col2.metric("Total Expected Loss", f"${total_el:,.0f}")
+        col3.metric("Avg EL Rate", f"{avg_el_rate:.4%}")
+        col4.metric("LGD Applied", f"{lgd:.0%}")
+
+        # EL by risk category
+        el_by_cat = df.groupby('Risk_Category', observed=True).agg(
+            Count=('Expected_Loss', 'count'),
+            Total_EAD=('EAD', 'sum'),
+            Total_EL=('Expected_Loss', 'sum'),
+            Avg_CPD=('CPD_2030', 'mean'),
+        ).reset_index()
+        el_by_cat['EL_Rate'] = el_by_cat['Total_EL'] / (el_by_cat['Total_EAD'] + 1e-8)
+
+        fig_el = px.bar(
+            el_by_cat, x='Risk_Category', y='Total_EL',
+            color='Risk_Category',
+            color_discrete_map={'Low': '#2ecc71', 'Medium': '#f39c12', 'High': '#e67e22', 'Critical': '#e74c3c'},
+            title='Expected Loss by Risk Category',
+            labels={'Total_EL': 'Expected Loss ($)', 'Risk_Category': 'Risk Category'},
+        )
+        fig_el.update_layout(template=_plotly_template(), height=400, showlegend=False)
+        st.plotly_chart(fig_el, use_container_width=True)
+
+        st.dataframe(
+            el_by_cat.style.format({
+                'Total_EAD': '${:,.0f}', 'Total_EL': '${:,.0f}',
+                'Avg_CPD': '{:.4f}', 'EL_Rate': '{:.4%}',
+            }),
+            use_container_width=True, hide_index=True,
+        )
+
+        # EL by sector if available
+        if 'purpose' in df.columns:
+            el_by_sector = df.groupby('purpose').agg(
+                Total_EL=('Expected_Loss', 'sum'),
+                Avg_CPD=('CPD_2030', 'mean'),
+                Loan_Count=('Expected_Loss', 'count'),
+            ).sort_values('Total_EL', ascending=False).reset_index()
+
+            fig_el_sector = px.bar(
+                el_by_sector.head(10), x='purpose', y='Total_EL',
+                title='Top 10 Sectors by Expected Loss',
+                color_discrete_sequence=['#e74c3c'],
+            )
+            fig_el_sector.update_layout(template=_plotly_template(), height=350)
+            st.plotly_chart(fig_el_sector, use_container_width=True)
+
+    # ── TAB 8: Time-Series Projections ──
+    with tab_proj:
+        st.subheader("CPD Projections (2025–2050)")
+        st.markdown(
+            "Shows how portfolio CPD evolves as carbon prices ramp up from today's "
+            "level to 2030 targets and beyond under each NGFS scenario."
+        )
+
+        years = config.PROJECTION_YEARS
+        current_carbon = 5  # approx current global avg carbon price (USD/tCO₂)
+        avg_baseline = baseline_pd.mean()
+        sample = df.iloc[:min(2000, len(df))]
+
+        # Pre-compute full CPD once per scenario, then scale by year
+        projection_data = []
+        for sc_name, target_price in config.CARBON_PRICES.items():
+            _, full_cpd = compute_cpd(sample, model, sc_name, severity_factor, transition_scaling)
+            avg_full_uplift = full_cpd.mean() - avg_baseline
+
+            for year in years:
+                if year <= 2030:
+                    frac = (year - 2025) / 5
+                    price_year = current_carbon + (target_price - current_carbon) * frac
+                else:
+                    price_year = target_price
+
+                price_ratio = price_year / (target_price + 1e-8)
+                avg_cpd_year = avg_baseline + avg_full_uplift * price_ratio
+
+                projection_data.append({
+                    'Year': year,
+                    'Scenario': sc_name.replace('_', ' ').title(),
+                    'Carbon Price': price_year,
+                    'Avg CPD': avg_cpd_year,
+                })
+
+        proj_df = pd.DataFrame(projection_data)
+
+        fig_proj = px.line(
+            proj_df, x='Year', y='Avg CPD', color='Scenario',
+            title='Projected Portfolio CPD Under NGFS Scenarios',
+            labels={'Avg CPD': 'Average CPD'},
+            markers=True,
+        )
+        fig_proj.update_layout(template=_plotly_template(), height=450)
+        st.plotly_chart(fig_proj, use_container_width=True)
+
+        # Carbon price trajectory chart
+        fig_price = px.line(
+            proj_df, x='Year', y='Carbon Price', color='Scenario',
+            title='Carbon Price Trajectory (USD/tCO₂)',
+            labels={'Carbon Price': 'Price ($/tCO₂)'},
+            markers=True,
+        )
+        fig_price.update_layout(template=_plotly_template(), height=350)
+        st.plotly_chart(fig_price, use_container_width=True)
+
+    # ── TAB 9: Stress Test Matrix ──
+    with tab_stress:
+        st.subheader("Stress Test Matrix")
+        st.markdown(
+            "CPD shift across all **4 NGFS scenarios × 3 severity levels** — "
+            "shows how the portfolio responds to combined physical and transition shocks."
+        )
+
+        severity_levels = {'Low (0.15)': 0.15, 'Medium (0.30)': 0.30, 'High (0.45)': 0.45}
+
+        with st.spinner("Computing stress scenarios…"):
+            # Use a subsample for speed
+            stress_sample = df.iloc[:min(5000, len(df))]
+            stress_rows = []
+            for sc_name, sc_price in config.CARBON_PRICES.items():
+                for sev_label, sev_val in severity_levels.items():
+                    _, stress_cpd = compute_cpd(
+                        stress_sample, model, sc_name, sev_val, transition_scaling,
+                    )
+                    avg_cpd = stress_cpd.mean()
+                    avg_uplift = ((stress_cpd - baseline_pd[:len(stress_cpd)]) / (baseline_pd[:len(stress_cpd)] + 1e-8) * 100).mean()
+                    high_crit = (pd.cut(stress_cpd, bins=config.RISK_BINS, labels=config.RISK_LABELS).isin(['High', 'Critical'])).sum()
+                    stress_rows.append({
+                        'Scenario': sc_name.replace('_', ' ').title(),
+                        'Carbon Price': f"${sc_price}/tCO₂",
+                        'Severity': sev_label,
+                        'Avg CPD': avg_cpd,
+                        'Avg Uplift %': avg_uplift,
+                        'High/Critical': high_crit,
+                        'High/Critical %': high_crit / len(stress_cpd) * 100,
+                    })
+
+        stress_df = pd.DataFrame(stress_rows)
+
+        # Pivot for matrix view
+        pivot_cpd = stress_df.pivot(index='Scenario', columns='Severity', values='Avg CPD')
+        pivot_cpd = pivot_cpd[list(severity_levels.keys())]  # ensure column order
+
+        st.markdown("#### Average CPD by Scenario × Severity")
+        st.dataframe(
+            pivot_cpd.style.background_gradient(cmap='Reds', axis=None).format('{:.4f}'),
+            use_container_width=True,
+        )
+
+        pivot_pct = stress_df.pivot(index='Scenario', columns='Severity', values='High/Critical %')
+        pivot_pct = pivot_pct[list(severity_levels.keys())]
+
+        st.markdown("#### % High/Critical Loans by Scenario × Severity")
+        st.dataframe(
+            pivot_pct.style.background_gradient(cmap='OrRd', axis=None).format('{:.1f}%'),
+            use_container_width=True,
+        )
+
+        # Heatmap chart
+        fig_stress = px.imshow(
+            pivot_cpd.values,
+            x=list(severity_levels.keys()),
+            y=pivot_cpd.index.tolist(),
+            color_continuous_scale='Reds',
+            labels={'color': 'Avg CPD'},
+            title='Stress Test Heatmap — Average CPD',
+            text_auto='.4f',
+        )
+        fig_stress.update_layout(template=_plotly_template(), height=350)
+        st.plotly_chart(fig_stress, use_container_width=True)
+
+    # ── Results columns (defined before tabs use them for Exports) ──
+    display_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose',
+                                'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
+                    if c in df.columns]
+
     # ── TAB 7: Full Results ──
     with tab_results:
         st.subheader("Loan-Level CPD Results")
-        display_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose',
-                                    'Baseline_PD', 'CPD_2030', 'PD_Uplift_%', 'Risk_Category']
-                        if c in df.columns]
         st.dataframe(df[display_cols].head(500), use_container_width=True)
 
     # ═══════════════════════════════════════════════

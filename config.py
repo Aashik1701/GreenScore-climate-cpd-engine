@@ -330,6 +330,14 @@ RISK_BINS = [0, 0.05, 0.15, 0.30, 1.0]
 RISK_LABELS = ['Low', 'Medium', 'High', 'Critical']
 
 # ─────────────────────────────────────────────────────────
+# Portfolio Loss Estimation (Expected Loss = PD × LGD × EAD)
+# ─────────────────────────────────────────────────────────
+# LGD (Loss Given Default): Basel II foundation IRB for unsecured consumer = 0.45
+DEFAULT_LGD = 0.45
+# Carbon price ramp-up years for time-series projection
+PROJECTION_YEARS = list(range(2025, 2051))
+
+# ─────────────────────────────────────────────────────────
 # Optuna Hyperparameter Tuning
 # ─────────────────────────────────────────────────────────
 OPTUNA_N_TRIALS = 75
