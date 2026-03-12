@@ -20,7 +20,7 @@ import folium
 from streamlit_folium import st_folium
 
 import config
-from cpd_engine import get_baseline_pd
+from cpd_engine import get_baseline_pd, add_climate_features
 from physical_risk import apply_physical_risk
 from transition_risk import apply_transition_risk
 from report_gen import generate_pdf_report
@@ -81,6 +81,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Model**: XGBoost (Optuna-tuned) + LightGBM + SHAP")
+    st.markdown("**Climate**: NASA POWER API + NGFS Phase V")
     st.markdown("**Regulatory**: RBI Climate Risk Framework 2024")
     st.markdown("---")
     st.markdown("### 📚 References")
@@ -171,7 +172,11 @@ if df is not None:
     if 'emp_length' in df.columns:
         df['emp_length'] = df['emp_length'].astype(str).str.extract(r'(\d+)').astype(float).fillna(0)
 
-    st.success(f"✅ Loaded {len(df):,} loans")
+    # Enrich with climate features (NASA POWER + NGFS)
+    with st.spinner("🌍 Enriching with climate features (NASA POWER + NGFS)..."):
+        df = add_climate_features(df)
+
+    st.success(f"✅ Loaded {len(df):,} loans — climate features added")
 
     with st.expander("📋 Preview Raw Data"):
         st.dataframe(df.head(20), use_container_width=True)
@@ -246,13 +251,13 @@ if df is not None:
         st.markdown("Side-by-side CPD analysis across all three NGFS scenarios.")
 
         scenario_results = {}
-        for sc_name in config.CARBON_PRICES:
+        sc_names = list(config.CARBON_PRICES.keys())
+        for sc_name in sc_names:
             _, sc_cpd = compute_cpd(df, model, sc_name, severity_factor, transition_scaling)
             scenario_results[sc_name] = sc_cpd
 
         # Metrics row
-        cols = st.columns(3)
-        sc_names = list(config.CARBON_PRICES.keys())
+        cols = st.columns(len(sc_names))
         for i, sc_name in enumerate(sc_names):
             sc_cpd = scenario_results[sc_name]
             sc_label = sc_name.replace('_', ' ').title()
@@ -382,8 +387,13 @@ if df is not None:
             try:
                 import shap
                 shap_sample = df.iloc[[loan_idx]]
-                X_sample = shap_sample[config.ALL_FEATURES].copy()
-                for feat in config.ALL_FEATURES:
+                model_n_features = getattr(model, 'n_features_in_', len(config.ALL_FEATURES))
+                if model_n_features > len(config.ALL_FEATURES):
+                    feat_names = config.ALL_FEATURES_CLIMATE
+                else:
+                    feat_names = config.ALL_FEATURES
+                X_sample = shap_sample[feat_names].copy()
+                for feat in feat_names:
                     if feat not in X_sample.columns:
                         X_sample[feat] = 0
                 X_sample = X_sample.fillna(X_sample.median())
@@ -392,7 +402,6 @@ if df is not None:
                 shap_vals = explainer(X_sample)
 
                 # Build a waterfall-style table (Streamlit-friendly)
-                feat_names = config.ALL_FEATURES
                 sv = shap_vals.values[0]
                 base = float(explainer.expected_value)
                 waterfall_df = pd.DataFrame({

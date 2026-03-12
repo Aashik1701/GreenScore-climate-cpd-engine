@@ -37,6 +37,31 @@ ENGINEERED_FEATURES = [
 
 ALL_FEATURES = BASE_FEATURES + ENGINEERED_FEATURES
 
+# Climate risk features fed into the model alongside financials
+PHYSICAL_RISK_FEATURES = [
+    'flood_freq_score',
+    'drought_severity_index',
+    'temp_anomaly_5yr',
+    'extreme_weather_events_count',
+    'physical_risk_score',
+]
+
+TRANSITION_RISK_FEATURES = [
+    'sector_carbon_intensity',
+    'policy_exposure_score',
+    'transition_risk_score',
+]
+
+GEOGRAPHIC_FEATURES = [
+    'coastal_proximity_km',
+    'elevation_meters',
+]
+
+CLIMATE_FEATURES = PHYSICAL_RISK_FEATURES + TRANSITION_RISK_FEATURES + GEOGRAPHIC_FEATURES
+
+# Full feature set for the climate-aware model
+ALL_FEATURES_CLIMATE = ALL_FEATURES + CLIMATE_FEATURES
+
 DEFAULT_STATUSES = ['Charged Off', 'Default', 'Late (31-120 days)']
 
 # DTI bins: [0–10, 10–20, 20–30, 30+]
@@ -239,9 +264,10 @@ SECTOR_EMISSIONS = {
 # Source: NGFS Phase V Technical Report, January 2025
 # https://www.ngfs.net/ngfs-scenarios-portal/
 CARBON_PRICES = {
-    'orderly':    100,   # Net Zero 2050 — gradual transition
-    'disorderly': 250,   # Delayed Transition — sudden policy shock
-    'hot_house':   25,   # Current Policies — minimal carbon pricing
+    'orderly':          100,   # Net Zero 2050 — gradual transition
+    'disorderly':       250,   # Delayed Transition — sudden policy shock
+    'hot_house':         25,   # Current Policies — minimal carbon pricing
+    'too_little_too_late': 175, # Delayed + insufficient action — BOTH risks HIGH
 }
 
 # ─────────────────────────────────────────────────────────
@@ -416,4 +442,88 @@ INDIA_STATE_COORDS = {
     'Ladakh':             [34.2, 77.6],
     'Lakshadweep':        [10.6, 72.6],
     'Puducherry':         [11.9, 79.8],
+}
+
+# ─────────────────────────────────────────────────────────
+# Geographic Features — Coastal Proximity & Elevation
+# ─────────────────────────────────────────────────────────
+# Approximate coastal proximity in km and mean elevation in metres
+# for each US state / Indian state.  Values are rough centroids for
+# portfolio-level analysis; a production system would geocode at the
+# borrower address level.
+
+STATE_COASTAL_PROXIMITY_KM = {
+    # US states — approximate distance from state centroid to coast
+    'AL': 200, 'AK': 100, 'AZ': 600, 'AR': 500, 'CA': 80, 'CO': 1400,
+    'CT': 20,  'DE': 10,  'DC': 60,  'FL': 30,  'GA': 150, 'HI': 5,
+    'ID': 700, 'IL': 600, 'IN': 500, 'IA': 800, 'KS': 1000, 'KY': 600,
+    'LA': 50,  'ME': 30,  'MD': 30,  'MA': 20,  'MI': 200, 'MN': 800,
+    'MS': 100, 'MO': 700, 'MT': 900, 'NE': 1200, 'NV': 500, 'NH': 40,
+    'NJ': 15,  'NM': 800, 'NY': 40,  'NC': 100, 'ND': 1500, 'OH': 400,
+    'OK': 700, 'OR': 80,  'PA': 150, 'RI': 10,  'SC': 80,  'SD': 1300,
+    'TN': 500, 'TX': 150, 'UT': 900, 'VT': 200, 'VA': 100, 'WA': 80,
+    'WV': 400, 'WI': 400, 'WY': 1200,
+    # Indian states
+    'Andhra Pradesh': 30, 'Arunachal Pradesh': 800, 'Assam': 600,
+    'Bihar': 700, 'Chhattisgarh': 500, 'Goa': 5, 'Gujarat': 20,
+    'Haryana': 1000, 'Himachal Pradesh': 1200, 'Jharkhand': 400,
+    'Karnataka': 60, 'Kerala': 10, 'Madhya Pradesh': 600,
+    'Maharashtra': 40, 'Manipur': 700, 'Meghalaya': 600,
+    'Mizoram': 600, 'Nagaland': 700, 'Odisha': 30, 'Punjab': 1100,
+    'Rajasthan': 500, 'Sikkim': 800, 'Tamil Nadu': 15,
+    'Telangana': 300, 'Tripura': 500, 'Uttar Pradesh': 800,
+    'Uttarakhand': 1000, 'West Bengal': 30,
+    'Delhi': 1000, 'Chandigarh': 1100, 'Puducherry': 5,
+    'Lakshadweep': 5, 'Ladakh': 1500, 'Jammu and Kashmir': 1200,
+    'Andaman and Nicobar Islands': 5,
+    'Dadra and Nagar Haveli and Daman and Diu': 10,
+    'OTHER': 500,
+}
+
+STATE_ELEVATION_METERS = {
+    # US states — approximate mean elevation
+    'AL': 150, 'AK': 580, 'AZ': 1250, 'AR': 200, 'CA': 880, 'CO': 2070,
+    'CT': 50,  'DE': 18,  'DC': 20,   'FL': 10,  'GA': 180, 'HI': 920,
+    'ID': 1520, 'IL': 180, 'IN': 210, 'IA': 330, 'KS': 610, 'KY': 230,
+    'LA': 10,  'ME': 180, 'MD': 110, 'MA': 150, 'MI': 280, 'MN': 370,
+    'MS': 90,  'MO': 240, 'MT': 1040, 'NE': 790, 'NV': 1680, 'NH': 300,
+    'NJ': 30,  'NM': 1740, 'NY': 300, 'NC': 210, 'ND': 580, 'OH': 260,
+    'OK': 400, 'OR': 1000, 'PA': 330, 'RI': 60,  'SC': 110, 'SD': 670,
+    'TN': 270, 'TX': 520, 'UT': 1860, 'VT': 300, 'VA': 290, 'WA': 520,
+    'WV': 460, 'WI': 320, 'WY': 2040,
+    # Indian states
+    'Andhra Pradesh': 250, 'Arunachal Pradesh': 2000, 'Assam': 80,
+    'Bihar': 50, 'Chhattisgarh': 500, 'Goa': 20, 'Gujarat': 100,
+    'Haryana': 220, 'Himachal Pradesh': 3000, 'Jharkhand': 450,
+    'Karnataka': 600, 'Kerala': 120, 'Madhya Pradesh': 450,
+    'Maharashtra': 400, 'Manipur': 800, 'Meghalaya': 1000,
+    'Mizoram': 900, 'Nagaland': 1200, 'Odisha': 100, 'Punjab': 230,
+    'Rajasthan': 350, 'Sikkim': 2700, 'Tamil Nadu': 200,
+    'Telangana': 500, 'Tripura': 80, 'Uttar Pradesh': 100,
+    'Uttarakhand': 2500, 'West Bengal': 40,
+    'Delhi': 215, 'Chandigarh': 330, 'Puducherry': 10,
+    'Lakshadweep': 2, 'Ladakh': 4500, 'Jammu and Kashmir': 2500,
+    'Andaman and Nicobar Islands': 50,
+    'Dadra and Nagar Haveli and Daman and Diu': 30,
+    'OTHER': 300,
+}
+
+# ─────────────────────────────────────────────────────────
+# Transition Risk — Sector Policy Exposure Scores (0–1)
+# ─────────────────────────────────────────────────────────
+# How exposed each sector is to carbon-pricing policy changes.
+# High = very exposed (e.g. coal); low = insulated (e.g. tech).
+SECTOR_POLICY_EXPOSURE = {
+    'cement': 0.85, 'steel': 0.80, 'thermal_power': 0.95,
+    'coal': 0.98, 'oil_gas': 0.82, 'chemicals': 0.60,
+    'manufacturing': 0.45, 'transport': 0.50, 'agriculture': 0.35,
+    'construction': 0.30, 'retail': 0.15, 'services': 0.10,
+    'technology': 0.08, 'healthcare': 0.10, 'renewables': 0.05,
+    # LendingClub purpose proxies
+    'debt_consolidation': 0.10, 'credit_card': 0.08,
+    'home_improvement': 0.20, 'small_business': 0.30,
+    'car': 0.45, 'medical': 0.10, 'moving': 0.15,
+    'vacation': 0.10, 'house': 0.20, 'wedding': 0.08,
+    'major_purchase': 0.18, 'educational': 0.05,
+    'renewable_energy': 0.05, 'other': 0.20,
 }

@@ -30,6 +30,7 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
 import config
+from nasa_power import get_physical_features_for_state, engineer_physical_features
 
 # ── Logging ──
 logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
@@ -89,13 +90,94 @@ def load_data(path: str, nrows: Optional[int] = None) -> pd.DataFrame:
     return df
 
 
+def add_climate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enrich a loan DataFrame with physical-risk, transition-risk, and
+    geographic features so that XGBoost can learn climate signals.
+
+    Adds the columns listed in ``config.CLIMATE_FEATURES``.
+    """
+    df = df.copy()
+    loc_col = 'addr_state' if 'addr_state' in df.columns else None
+    purpose_col = 'purpose' if 'purpose' in df.columns else None
+
+    # ── Physical risk features (NASA POWER) ──
+    if loc_col:
+        unique_states = df[loc_col].dropna().unique()
+        state_features = {}
+        for state in unique_states:
+            state_features[state] = get_physical_features_for_state(
+                state, config.US_STATE_COORDS, config.INDIA_STATE_COORDS,
+            )
+        for feat in config.PHYSICAL_RISK_FEATURES:
+            df[feat] = df[loc_col].map(
+                lambda s, f=feat: state_features.get(s, {}).get(f, 0.3)
+            )
+    else:
+        for feat in config.PHYSICAL_RISK_FEATURES:
+            default_val = 0.3 if 'score' in feat or 'index' in feat else 0.0
+            df[feat] = default_val
+
+    # ── Transition risk features (NGFS) ──
+    if purpose_col:
+        cleaned = df[purpose_col].str.lower().str.replace(' ', '_')
+        df['sector_carbon_intensity'] = cleaned.map(
+            lambda x: config.SECTOR_EMISSIONS.get(x, config.SECTOR_EMISSIONS['other'])
+        )
+        df['policy_exposure_score'] = cleaned.map(
+            lambda x: config.SECTOR_POLICY_EXPOSURE.get(x, 0.20)
+        )
+        # Composite transition risk score
+        df['transition_risk_score'] = (
+            0.60 * df['sector_carbon_intensity'].clip(0, 1)
+            + 0.40 * df['policy_exposure_score']
+        ).clip(0, 1)
+    else:
+        df['sector_carbon_intensity'] = 0.25
+        df['policy_exposure_score'] = 0.20
+        df['transition_risk_score'] = 0.22
+
+    # ── Geographic features ──
+    if loc_col:
+        df['coastal_proximity_km'] = df[loc_col].map(
+            lambda s: config.STATE_COASTAL_PROXIMITY_KM.get(s, 500)
+        )
+        df['elevation_meters'] = df[loc_col].map(
+            lambda s: config.STATE_ELEVATION_METERS.get(s, 300)
+        )
+    else:
+        df['coastal_proximity_km'] = 500
+        df['elevation_meters'] = 300
+
+    logger.info(
+        "Climate features added — %d physical, %d transition, %d geographic.",
+        len(config.PHYSICAL_RISK_FEATURES),
+        len(config.TRANSITION_RISK_FEATURES),
+        len(config.GEOGRAPHIC_FEATURES),
+    )
+    return df
+
+
 # ─────────────────────────────────────────────────────────
 # Model Training
 # ─────────────────────────────────────────────────────────
 
-def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Select and impute model features."""
-    X = df[config.ALL_FEATURES].copy()
+def _prepare_features(df: pd.DataFrame, include_climate: bool = True) -> pd.DataFrame:
+    """Select and impute model features.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input data (must contain at least ``config.ALL_FEATURES`` columns).
+    include_climate : bool
+        If *True* and climate columns are present, use the full
+        ``ALL_FEATURES_CLIMATE`` feature set.
+    """
+    if include_climate and all(f in df.columns for f in config.CLIMATE_FEATURES):
+        feature_cols = config.ALL_FEATURES_CLIMATE
+    else:
+        feature_cols = config.ALL_FEATURES
+    X = df[feature_cols].copy()
     X = X.fillna(X.median())
     return X
 
@@ -118,7 +200,12 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
         Dictionary with AUC scores for all models and CV statistics.
     """
     os.makedirs(save_dir, exist_ok=True)
-    X = _prepare_features(df)
+
+    # Enrich with climate features if not already present
+    if not all(f in df.columns for f in config.CLIMATE_FEATURES):
+        df = add_climate_features(df)
+
+    X = _prepare_features(df, include_climate=True)
     y = df['default']
 
     # Class imbalance ratio
@@ -186,6 +273,8 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
     )
     xgb_auc = roc_auc_score(y_test, xgb.predict_proba(X_test)[:, 1])
     logger.info("XGBoost AUC: %.4f", xgb_auc)
+
+    logger.info("Model trained on %d features: %s", X.shape[1], list(X.columns))
 
     # ── 5-Fold Stratified CV for XGBoost ──
     skf = StratifiedKFold(n_splits=config.CV_FOLDS, shuffle=True, random_state=config.RANDOM_STATE)
@@ -323,6 +412,7 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
     Get baseline PD predictions for loan data.
 
     Automatically engineers the required features if they are missing.
+    Uses climate features if the model was trained with them.
     """
     df = loan_data.copy()
 
@@ -340,7 +430,16 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
             df['fico_range_low'], bins=config.FICO_BINS, labels=config.FICO_LABELS, include_lowest=True
         ).astype(float)
 
-    X = df[config.ALL_FEATURES].fillna(df[config.ALL_FEATURES].median())
+    # Add climate features if the model expects them
+    model_n_features = getattr(model, 'n_features_in_', len(config.ALL_FEATURES))
+    if model_n_features > len(config.ALL_FEATURES):
+        if not all(f in df.columns for f in config.CLIMATE_FEATURES):
+            df = add_climate_features(df)
+        feature_cols = config.ALL_FEATURES_CLIMATE
+    else:
+        feature_cols = config.ALL_FEATURES
+
+    X = df[feature_cols].fillna(df[feature_cols].median())
     return model.predict_proba(X)[:, 1]
 
 
@@ -356,6 +455,8 @@ if __name__ == '__main__':
     if do_tune:
         print(f"Optuna tuning enabled ({config.OPTUNA_N_TRIALS} trials)")
     df = load_data(path, nrows=nrows)
+    print("Adding climate features (NASA POWER + NGFS)…")
+    df = add_climate_features(df)
     model, results = train_baseline_pd(df, tune=do_tune)
     print("\n═══ Model Comparison ═══")
     print(f"  XGBoost AUC (hold-out):   {results['xgboost_auc']:.4f}")

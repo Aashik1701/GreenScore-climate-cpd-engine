@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import config
 from physical_risk import apply_physical_risk, compute_physical_risk_score
 from transition_risk import apply_transition_risk, map_purpose_to_sector
+from nasa_power import engineer_physical_features, _cache_key
 
 
 # ─────────────────────────────────────────────────────────
@@ -26,27 +27,33 @@ class TestPhysicalRisk:
     """Tests for physical_risk module."""
 
     def test_known_state_scores(self):
-        """Known US states should return their configured risk score."""
+        """Known US states should return their configured risk score (static mode)."""
         states = pd.Series(['FL', 'NY', 'CA', 'LA'])
-        scores = compute_physical_risk_score(states)
+        scores = compute_physical_risk_score(states, use_nasa=False)
         assert scores.iloc[0] == config.STATE_PHYSICAL_RISK['FL']
         assert scores.iloc[1] == config.STATE_PHYSICAL_RISK['NY']
         assert scores.iloc[2] == config.STATE_PHYSICAL_RISK['CA']
         assert scores.iloc[3] == config.STATE_PHYSICAL_RISK['LA']
 
     def test_indian_state_scores(self):
-        """Indian states should return configured risk scores."""
+        """Indian states should return configured risk scores (static mode)."""
         states = pd.Series(['Odisha', 'Kerala', 'Rajasthan'])
-        scores = compute_physical_risk_score(states)
+        scores = compute_physical_risk_score(states, use_nasa=False)
         assert scores.iloc[0] == 0.90  # Odisha — highest
         assert scores.iloc[1] == 0.70  # Kerala
         assert scores.iloc[2] == 0.50  # Rajasthan
 
     def test_unknown_state_fallback(self):
-        """Unknown states should get the OTHER fallback score."""
+        """Unknown states should get the OTHER fallback score (static mode)."""
         states = pd.Series(['ZZ', 'UNKNOWN', ''])
-        scores = compute_physical_risk_score(states)
+        scores = compute_physical_risk_score(states, use_nasa=False)
         assert all(scores == config.STATE_PHYSICAL_RISK['OTHER'])
+
+    def test_nasa_mode_returns_valid_scores(self):
+        """NASA mode should return scores in [0, 1] range."""
+        states = pd.Series(['FL', 'CA'])
+        scores = compute_physical_risk_score(states, use_nasa=True)
+        assert all(0 <= s <= 1 for s in scores)
 
     def test_all_50_us_states_covered(self):
         """All 50 US states + DC should have a risk score."""
@@ -307,3 +314,128 @@ class TestDatasetAdapters:
         assert 'lendingclub' in DATASET_REGISTRY
         assert 'home_credit' in DATASET_REGISTRY
         assert 'indian_bank' in DATASET_REGISTRY
+
+
+# ─────────────────────────────────────────────────────────
+# NASA POWER Feature Engineering Tests
+# ─────────────────────────────────────────────────────────
+
+class TestNASAPower:
+    """Tests for the NASA POWER climate feature engineering."""
+
+    def test_engineer_features_with_data(self):
+        """Valid raw climate data should produce all 5 physical features."""
+        raw = {
+            'T2M': {str(m): 15 + 10 * np.sin(m / 6 * np.pi)
+                    for m in range(1, 169)},
+            'PRECTOTCORR': {str(m): max(0, 2 + np.random.default_rng(42).normal(0, 1))
+                            for m in range(1, 169)},
+        }
+        features = engineer_physical_features(raw)
+        assert 'flood_freq_score' in features
+        assert 'drought_severity_index' in features
+        assert 'temp_anomaly_5yr' in features
+        assert 'extreme_weather_events_count' in features
+        assert 'physical_risk_score' in features
+        assert 0 <= features['physical_risk_score'] <= 1
+
+    def test_engineer_features_none_input(self):
+        """None input should return fallback features."""
+        features = engineer_physical_features(None)
+        assert features['physical_risk_score'] == 0.30
+        assert features['flood_freq_score'] == 0.30
+
+    def test_engineer_features_empty_data(self):
+        """Empty data dict should return fallback."""
+        features = engineer_physical_features({})
+        assert features['physical_risk_score'] == 0.30
+
+    def test_engineer_features_sentinel_values(self):
+        """Data with only -999 sentinel values should return fallback."""
+        raw = {
+            'T2M': {str(m): -999 for m in range(1, 169)},
+            'PRECTOTCORR': {str(m): -999 for m in range(1, 169)},
+        }
+        features = engineer_physical_features(raw)
+        assert features['physical_risk_score'] == 0.30
+
+    def test_cache_key_format(self):
+        """Cache key should be a deterministic lat_lon string."""
+        key = _cache_key(42.2, -74.9)
+        assert key == '42.2_-74.9'
+
+    def test_cache_key_rounds(self):
+        """Cache key should round to 1 decimal."""
+        key = _cache_key(42.249, -74.851)
+        assert key == '42.2_-74.9'
+
+
+# ─────────────────────────────────────────────────────────
+# 4th NGFS Scenario Tests
+# ─────────────────────────────────────────────────────────
+
+class TestFourthNGFSScenario:
+    """Tests for the Too Little Too Late scenario."""
+
+    def test_too_little_too_late_exists(self):
+        """Config should contain the fourth NGFS scenario."""
+        assert 'too_little_too_late' in config.CARBON_PRICES
+
+    def test_too_little_too_late_price(self):
+        """Price should be between orderly and disorderly."""
+        price = config.CARBON_PRICES['too_little_too_late']
+        assert config.CARBON_PRICES['hot_house'] < price < config.CARBON_PRICES['disorderly']
+
+    def test_transition_risk_with_fourth_scenario(self):
+        """apply_transition_risk should work with the new scenario."""
+        pd_phys = np.array([0.10])
+        purpose = pd.Series(['car'])
+        income = pd.Series([50000])
+        cpd = apply_transition_risk(pd_phys, purpose, income, 'too_little_too_late')
+        assert 0 <= cpd[0] <= 1
+
+    def test_fourth_scenario_between_orderly_and_disorderly(self):
+        """Too-Little-Too-Late CPD should fall between orderly and disorderly."""
+        pd_phys = np.array([0.10])
+        purpose = pd.Series(['small_business'])
+        income = pd.Series([50000])
+        cpd_orderly = apply_transition_risk(pd_phys, purpose, income, 'orderly')
+        cpd_tltl = apply_transition_risk(pd_phys, purpose, income, 'too_little_too_late')
+        cpd_disorderly = apply_transition_risk(pd_phys, purpose, income, 'disorderly')
+        assert cpd_orderly[0] <= cpd_tltl[0] <= cpd_disorderly[0]
+
+
+# ─────────────────────────────────────────────────────────
+# Climate Feature Config Tests
+# ─────────────────────────────────────────────────────────
+
+class TestClimateFeatureConfig:
+    """Tests for climate feature configuration."""
+
+    def test_climate_features_defined(self):
+        """Climate feature lists should exist in config."""
+        assert len(config.PHYSICAL_RISK_FEATURES) == 5
+        assert len(config.TRANSITION_RISK_FEATURES) == 3
+        assert len(config.GEOGRAPHIC_FEATURES) == 2
+
+    def test_all_features_climate_is_superset(self):
+        """ALL_FEATURES_CLIMATE should contain all base + climate features."""
+        for feat in config.ALL_FEATURES:
+            assert feat in config.ALL_FEATURES_CLIMATE
+        for feat in config.CLIMATE_FEATURES:
+            assert feat in config.ALL_FEATURES_CLIMATE
+
+    def test_coastal_proximity_lookup(self):
+        """Coastal proximity should be defined for key states."""
+        assert config.STATE_COASTAL_PROXIMITY_KM['FL'] < 50  # Florida is coastal
+        assert config.STATE_COASTAL_PROXIMITY_KM['CO'] > 1000  # Colorado is inland
+
+    def test_elevation_lookup(self):
+        """Elevation should be defined for key states."""
+        assert config.STATE_ELEVATION_METERS['CO'] > 2000  # Colorado is high
+        assert config.STATE_ELEVATION_METERS['FL'] < 20  # Florida is flat
+
+    def test_policy_exposure_defined(self):
+        """Sector policy exposure should be defined."""
+        assert config.SECTOR_POLICY_EXPOSURE['coal'] > 0.9
+        assert config.SECTOR_POLICY_EXPOSURE['technology'] < 0.2
