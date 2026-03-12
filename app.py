@@ -2,11 +2,13 @@
 GreenScore — Streamlit Dashboard
 ==================================
 Main entry point for the Climate-Adjusted Credit Risk Engine.
-Provides scenario selection, CSV upload, CPD computation,
-interactive charts, geographic heatmap, and report generation.
+Provides scenario selection, dataset selector, CSV upload, CPD
+computation, interactive charts, geographic heatmap, SHAP
+explanations, and report generation.
 """
 
 import logging
+import os
 
 import joblib
 import numpy as np
@@ -22,6 +24,7 @@ from cpd_engine import get_baseline_pd
 from physical_risk import apply_physical_risk
 from transition_risk import apply_transition_risk
 from report_gen import generate_pdf_report
+from dataset_adapters import DATASET_REGISTRY, adapt_home_credit, adapt_indian_bank
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,17 @@ with st.sidebar:
     st.metric("Carbon Price (2030)", f"${carbon_price}/tCO₂")
 
     st.markdown("---")
+    st.subheader("📁 Dataset Source")
+    dataset_options = {k: v['label'] for k, v in DATASET_REGISTRY.items()}
+    dataset_options['custom'] = '📂 Custom Upload'
+    dataset_choice = st.selectbox(
+        "Select Dataset",
+        list(dataset_options.keys()),
+        format_func=lambda x: dataset_options[x],
+        help="Choose a built-in dataset or upload your own CSV",
+    )
+
+    st.markdown("---")
     st.subheader("🎚️ Sensitivity Analysis")
     severity_factor = st.slider(
         "Physical Risk Severity Factor",
@@ -66,7 +80,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("**Model**: XGBoost + Physical + Transition Risk")
+    st.markdown("**Model**: XGBoost (Optuna-tuned) + LightGBM + SHAP")
     st.markdown("**Regulatory**: RBI Climate Risk Framework 2024")
     st.markdown("---")
     st.markdown("### 📚 References")
@@ -105,28 +119,50 @@ def compute_cpd(df, model, scenario_key, sev_factor, trans_scaling):
 
 
 # ─────────────────────────────────────────────────────────
-# File Upload + Validation
+# Data Loading — Built-in datasets or custom upload
 # ─────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "📂 Upload Loan Portfolio (CSV)",
-    type=['csv'],
-    help=f"Required: {', '.join(REQUIRED_COLS)}. Optional: {', '.join(OPTIONAL_COLS)}",
-)
+df = None
 
-if uploaded:
-    df = pd.read_csv(uploaded, low_memory=False)
-
-    # ── Input Validation ──
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        st.error(f"❌ **Missing required columns:** {', '.join(missing)}")
-        st.markdown("Your CSV must contain these columns:")
-        for col in REQUIRED_COLS:
-            icon = "✅" if col in df.columns else "❌"
-            st.markdown(f"  {icon} `{col}`")
+if dataset_choice == 'custom':
+    uploaded = st.file_uploader(
+        "📂 Upload Loan Portfolio (CSV)",
+        type=['csv'],
+        help=f"Required: {', '.join(REQUIRED_COLS)}. Optional: {', '.join(OPTIONAL_COLS)}",
+    )
+    if uploaded:
+        df = pd.read_csv(uploaded, low_memory=False)
+else:
+    ds_info = DATASET_REGISTRY[dataset_choice]
+    ds_path = ds_info['path']
+    if not os.path.exists(ds_path):
+        st.error(f"❌ Dataset file not found: `{ds_path}`. Please download it first (see README).")
         st.stop()
 
-    # Clean numeric types
+    @st.cache_data(show_spinner=f"Loading {ds_info['label']}…")
+    def _load_builtin(key, path, nrows=50000):
+        if DATASET_REGISTRY[key]['loader'] is not None:
+            return DATASET_REGISTRY[key]['loader'](path=path, nrows=nrows)
+        else:
+            from cpd_engine import load_data
+            return load_data(path, nrows=nrows)
+
+    df = _load_builtin(dataset_choice, ds_path)
+    st.success(f"✅ Loaded **{ds_info['label']}** — {len(df):,} loans")
+
+if df is not None:
+
+    # ── Input Validation (custom uploads only) ──
+    if dataset_choice == 'custom':
+        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        if missing:
+            st.error(f"❌ **Missing required columns:** {', '.join(missing)}")
+            st.markdown("Your CSV must contain these columns:")
+            for col in REQUIRED_COLS:
+                icon = "✅" if col in df.columns else "❌"
+                st.markdown(f"  {icon} `{col}`")
+            st.stop()
+
+    # Clean numeric types (safe for all sources)
     for col in ['dti', 'annual_inc', 'fico_range_low', 'installment']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace('%', '', regex=False), errors='coerce')
@@ -161,8 +197,8 @@ if uploaded:
     # ═══════════════════════════════════════════════
     # TABS
     # ═══════════════════════════════════════════════
-    tab_overview, tab_compare, tab_map, tab_sector, tab_top20, tab_results = st.tabs([
-        "📊 Overview", "🔀 Multi-Scenario", "🗺️ Heatmap", "🏭 Sectors", "🔝 Top 20 Risk", "📋 Results",
+    tab_overview, tab_compare, tab_map, tab_sector, tab_shap, tab_top20, tab_results = st.tabs([
+        "📊 Overview", "🔀 Multi-Scenario", "🗺️ Heatmap", "🏭 Sectors", "🔍 SHAP", "🔝 Top 20 Risk", "📋 Results",
     ])
 
     # ── TAB 1: Overview ──
@@ -309,7 +345,78 @@ if uploaded:
         else:
             st.info("No `purpose` column found.")
 
-    # ── TAB 5: Top 20 Riskiest Loans ──
+    # ── TAB 5: SHAP Explainability ──
+    with tab_shap:
+        st.subheader("🔍 SHAP Feature Explanations")
+        st.markdown(
+            "SHAP (SHapley Additive exPlanations) values show **how each feature "
+            "contributes to individual predictions**. Red = pushes PD higher, Blue = pushes PD lower."
+        )
+
+        shap_beeswarm = os.path.join('models', 'shap_beeswarm.png')
+        shap_importance = os.path.join('models', 'shap_importance.png')
+
+        if os.path.exists(shap_beeswarm) and os.path.exists(shap_importance):
+            shap_col1, shap_col2 = st.columns(2)
+            with shap_col1:
+                st.markdown("#### Beeswarm Plot")
+                st.image(shap_beeswarm, use_container_width=True)
+                st.caption(
+                    "Each dot = one loan. Position on X-axis = SHAP value (impact on PD). "
+                    "Color = feature value (red = high, blue = low)."
+                )
+            with shap_col2:
+                st.markdown("#### Feature Importance (Mean |SHAP|)")
+                st.image(shap_importance, use_container_width=True)
+                st.caption(
+                    "Average absolute SHAP value per feature. Higher = more influential on default prediction."
+                )
+
+            # Live SHAP for a single loan
+            st.markdown("---")
+            st.markdown("#### 🔬 Explain a Single Loan")
+            loan_idx = st.number_input(
+                "Select loan index to explain",
+                min_value=0, max_value=len(df) - 1, value=0, step=1,
+            )
+            try:
+                import shap
+                shap_sample = df.iloc[[loan_idx]]
+                X_sample = shap_sample[config.ALL_FEATURES].copy()
+                for feat in config.ALL_FEATURES:
+                    if feat not in X_sample.columns:
+                        X_sample[feat] = 0
+                X_sample = X_sample.fillna(X_sample.median())
+
+                explainer = shap.TreeExplainer(model)
+                shap_vals = explainer(X_sample)
+
+                # Build a waterfall-style table (Streamlit-friendly)
+                feat_names = config.ALL_FEATURES
+                sv = shap_vals.values[0]
+                base = float(explainer.expected_value)
+                waterfall_df = pd.DataFrame({
+                    'Feature': feat_names,
+                    'Feature Value': [f"{X_sample[f].values[0]:.4f}" for f in feat_names],
+                    'SHAP Value': sv,
+                    'Direction': ['↑ Increases PD' if v > 0 else '↓ Decreases PD' for v in sv],
+                }).sort_values('SHAP Value', key=abs, ascending=False)
+
+                st.markdown(f"**Base value (avg prediction):** {base:.4f}")
+                st.markdown(f"**This loan's predicted PD:** {base + sv.sum():.4f}")
+                st.dataframe(
+                    waterfall_df.style.background_gradient(subset=['SHAP Value'], cmap='RdBu_r'),
+                    use_container_width=True, hide_index=True,
+                )
+            except Exception as e:
+                st.warning(f"Live SHAP explanation unavailable: {e}")
+        else:
+            st.warning(
+                "⚠️ SHAP plots not found. Retrain the model with:\n\n"
+                "```bash\npython3 cpd_engine.py data/accepted_2007_to_2018Q4.csv 500000 --tune\n```"
+            )
+
+    # ── TAB 6: Top 20 Riskiest Loans ──
     with tab_top20:
         st.subheader("🔝 Top 20 Riskiest Loans")
         top_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose', 'annual_inc',
@@ -321,7 +428,7 @@ if uploaded:
             use_container_width=True,
         )
 
-    # ── TAB 6: Full Results ──
+    # ── TAB 7: Full Results ──
     with tab_results:
         st.subheader("📋 Loan-Level CPD Results")
         display_cols = [c for c in ['loan_amnt', 'addr_state', 'purpose',

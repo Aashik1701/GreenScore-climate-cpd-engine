@@ -1,8 +1,8 @@
               precision    recall  f1-score   support
 
-        Paid       0.89      0.63      0.74     32825
-     Default       0.28      0.65      0.39      7175
+        Paid       0.91      0.63      0.74     83599
+     Default       0.27      0.69      0.38     16358
 
-    accuracy                           0.64     40000
-   macro avg       0.59      0.64      0.57     40000
-weighted avg       0.78      0.64      0.68     40000
+    accuracy                           0.64     99957
+   macro avg       0.59      0.66      0.56     99957
+weighted avg       0.81      0.64      0.68     99957
