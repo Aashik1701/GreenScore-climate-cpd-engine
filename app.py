@@ -312,47 +312,195 @@ if df is not None:
         )
         st.plotly_chart(fig_compare, use_container_width=True)
 
-    # ── TAB 3: Geographic Heatmap ──
+    # ── TAB 3: Geographic Climate Risk Map ──
     with tab_map:
-        st.subheader("Geographic Climate Risk Heatmap")
+        st.subheader("Geographic Climate Risk Map")
         loc_col = 'addr_state' if 'addr_state' in df.columns else None
         if loc_col:
-            state_risk = df.groupby(loc_col)['CPD_2030'].mean().reset_index()
+            # ── Aggregate state-level metrics ──
+            state_agg = df.groupby(loc_col).agg(
+                Avg_CPD=('CPD_2030', 'mean'),
+                Avg_Baseline_PD=('Baseline_PD', 'mean'),
+                Avg_Uplift=('PD_Uplift_%', 'mean'),
+                Loan_Count=('CPD_2030', 'count'),
+                Total_Exposure=('loan_amnt', 'sum') if 'loan_amnt' in df.columns else ('CPD_2030', 'count'),
+                High_Critical=('Risk_Category', lambda x: x.isin(['High', 'Critical']).sum()),
+            ).reset_index()
+            state_agg['High_Critical_Pct'] = (state_agg['High_Critical'] / state_agg['Loan_Count'] * 100).round(1)
+            state_agg['Physical_Risk'] = state_agg[loc_col].map(
+                lambda s: config.STATE_PHYSICAL_RISK.get(str(s).strip(), config.STATE_PHYSICAL_RISK.get('OTHER', 0.5))
+            )
 
-            # Detect if US or India data
+            # ── Map Controls ──
+            ctrl_col1, ctrl_col2 = st.columns(2)
+            with ctrl_col1:
+                map_metric = st.selectbox(
+                    "Color bubbles by",
+                    ["Avg CPD", "Physical Risk Score", "% High/Critical", "PD Uplift %"],
+                    index=0,
+                )
+            with ctrl_col2:
+                map_filter = st.multiselect(
+                    "Show states where Risk Category includes",
+                    ["Low", "Medium", "High", "Critical"],
+                    default=["Low", "Medium", "High", "Critical"],
+                )
+
+            # Filter states: keep only those with at least one loan in selected categories
+            if map_filter:
+                states_with_cat = df[df['Risk_Category'].isin(map_filter)][loc_col].unique()
+                state_agg_filtered = state_agg[state_agg[loc_col].isin(states_with_cat)]
+            else:
+                state_agg_filtered = state_agg
+
+            # ── Summary metrics above map ──
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            m_col1.metric("States Shown", f"{len(state_agg_filtered)}")
+            m_col2.metric("Total Loans", f"{state_agg_filtered['Loan_Count'].sum():,}")
+            m_col3.metric("Highest Avg CPD", f"{state_agg_filtered['Avg_CPD'].max():.4f}" if len(state_agg_filtered) else "—")
+            worst_state = state_agg_filtered.loc[state_agg_filtered['Avg_CPD'].idxmax(), loc_col] if len(state_agg_filtered) else "—"
+            m_col4.metric("Riskiest State", worst_state)
+
+            # ── Detect geography ──
             sample_states = df[loc_col].dropna().unique()[:10]
             is_us = any(len(str(s).strip()) == 2 for s in sample_states)
 
             if is_us:
-                m = folium.Map(location=[39.8, -98.5], zoom_start=4)
+                center, zoom = [39.8, -98.5], 4
                 coord_map = config.US_STATE_COORDS
             else:
-                m = folium.Map(location=[20, 77], zoom_start=5)
+                center, zoom = [20, 77], 5
                 coord_map = config.INDIA_STATE_COORDS
 
-            for _, row in state_risk.iterrows():
+            # ── Build color scale ──
+            import branca.colormap as cm
+
+            metric_col_map = {
+                "Avg CPD": "Avg_CPD",
+                "Physical Risk Score": "Physical_Risk",
+                "% High/Critical": "High_Critical_Pct",
+                "PD Uplift %": "Avg_Uplift",
+            }
+            val_col = metric_col_map[map_metric]
+            vmin = state_agg_filtered[val_col].min() if len(state_agg_filtered) else 0
+            vmax = state_agg_filtered[val_col].max() if len(state_agg_filtered) else 1
+            if vmin == vmax:
+                vmax = vmin + 0.01
+
+            colormap = cm.LinearColormap(
+                colors=['#2ecc71', '#f1c40f', '#e67e22', '#e74c3c'],
+                vmin=vmin, vmax=vmax,
+                caption=map_metric,
+            )
+
+            # ── Create map ──
+            m = folium.Map(location=center, zoom_start=zoom, tiles='cartodbpositron')
+
+            # Layer: CPD Bubbles (main)
+            bubble_layer = folium.FeatureGroup(name="Risk Bubbles")
+
+            for _, row in state_agg_filtered.iterrows():
                 state = str(row[loc_col]).strip()
-                cpd_val = float(row['CPD_2030'])
+                if state not in coord_map:
+                    continue
+                lat, lon = coord_map[state]
 
-                if state in coord_map:
-                    lat, lon = coord_map[state]
-                elif state in config.US_STATE_COORDS:
-                    lat, lon = config.US_STATE_COORDS[state]
-                elif state in config.INDIA_STATE_COORDS:
-                    lat, lon = config.INDIA_STATE_COORDS[state]
-                else:
-                    continue  # Skip unknown states instead of random placement
+                val = row[val_col]
+                color_hex = colormap(val)
+                loan_count = int(row['Loan_Count'])
+                # Scale radius by loan count (log scale) with min/max bounds
+                radius = max(6, min(25, 4 + np.log1p(loan_count) * 2.5))
 
-                color = 'red' if cpd_val > 0.2 else ('orange' if cpd_val > 0.1 else 'green')
+                # Rich popup HTML
+                exposure_str = f"${row['Total_Exposure']:,.0f}" if 'loan_amnt' in df.columns else f"{loan_count} loans"
+                popup_html = f"""
+                <div style="font-family:Arial,sans-serif;min-width:200px;">
+                    <h4 style="margin:0 0 6px 0;border-bottom:2px solid {color_hex};padding-bottom:4px;">{state}</h4>
+                    <table style="font-size:13px;line-height:1.6;">
+                        <tr><td style="color:#666;">Avg CPD</td><td style="text-align:right;font-weight:600;">{row['Avg_CPD']:.4f}</td></tr>
+                        <tr><td style="color:#666;">Baseline PD</td><td style="text-align:right;">{row['Avg_Baseline_PD']:.4f}</td></tr>
+                        <tr><td style="color:#666;">PD Uplift</td><td style="text-align:right;">{row['Avg_Uplift']:.1f}%</td></tr>
+                        <tr><td style="color:#666;">Physical Risk</td><td style="text-align:right;">{row['Physical_Risk']:.2f}</td></tr>
+                        <tr><td style="color:#666;">Loans</td><td style="text-align:right;">{loan_count:,}</td></tr>
+                        <tr><td style="color:#666;">Exposure</td><td style="text-align:right;">{exposure_str}</td></tr>
+                        <tr><td style="color:#666;">High/Critical</td><td style="text-align:right;">{row['High_Critical']:,.0f} ({row['High_Critical_Pct']:.1f}%)</td></tr>
+                    </table>
+                </div>
+                """
                 folium.CircleMarker(
                     location=[lat, lon],
-                    radius=max(5, cpd_val * 40),
-                    color=color, fill=True, fill_opacity=0.7,
-                    popup=f"<b>{state}</b><br>CPD: {cpd_val:.4f}",
-                    tooltip=f"{state}: {cpd_val:.4f}",
-                ).add_to(m)
+                    radius=radius,
+                    color=color_hex, fill=True, fill_color=color_hex,
+                    fill_opacity=0.75, weight=1.5, opacity=0.9,
+                    popup=folium.Popup(popup_html, max_width=280),
+                    tooltip=f"{state} — {map_metric}: {val:.4f}" if val_col != 'High_Critical_Pct' else f"{state} — {map_metric}: {val:.1f}%",
+                ).add_to(bubble_layer)
 
-            st_folium(m, use_container_width=True, height=500)
+            bubble_layer.add_to(m)
+
+            # Layer: Physical Risk Heatmap (optional overlay)
+            from folium.plugins import HeatMap
+            heat_data = []
+            for _, row in state_agg_filtered.iterrows():
+                state = str(row[loc_col]).strip()
+                if state in coord_map:
+                    lat, lon = coord_map[state]
+                    heat_data.append([lat, lon, row['Physical_Risk']])
+
+            heat_layer = folium.FeatureGroup(name="Physical Risk Heatmap", show=False)
+            HeatMap(
+                heat_data, radius=35, blur=25, max_zoom=6,
+                gradient={0.2: '#2ecc71', 0.5: '#f1c40f', 0.7: '#e67e22', 1.0: '#e74c3c'},
+            ).add_to(heat_layer)
+            heat_layer.add_to(m)
+
+            # Add layer control + legend
+            folium.LayerControl(collapsed=False).add_to(m)
+            m.add_child(colormap)
+
+            st_folium(m, use_container_width=True, height=550)
+
+            # ── State-level summary table ──
+            st.markdown("#### State-Level Risk Summary")
+            table_df = state_agg_filtered.rename(columns={
+                loc_col: 'State',
+                'Avg_CPD': 'Avg CPD',
+                'Avg_Baseline_PD': 'Avg Baseline PD',
+                'Avg_Uplift': 'PD Uplift %',
+                'Loan_Count': 'Loans',
+                'Total_Exposure': 'Total Exposure',
+                'High_Critical': 'High/Critical',
+                'High_Critical_Pct': 'H/C %',
+                'Physical_Risk': 'Physical Risk',
+            }).sort_values('Avg CPD', ascending=False)
+
+            fmt = {
+                'Avg CPD': '{:.4f}', 'Avg Baseline PD': '{:.4f}',
+                'PD Uplift %': '{:.1f}%', 'Physical Risk': '{:.2f}',
+                'H/C %': '{:.1f}%',
+            }
+            if 'loan_amnt' in df.columns:
+                fmt['Total Exposure'] = '${:,.0f}'
+
+            st.dataframe(
+                table_df.style
+                    .background_gradient(subset=['Avg CPD'], cmap='Reds')
+                    .background_gradient(subset=['Physical Risk'], cmap='YlOrRd')
+                    .format(fmt),
+                use_container_width=True, hide_index=True, height=400,
+            )
+
+            # ── Plotly bar chart: Top 10 riskiest states ──
+            top_states = state_agg.nlargest(10, 'Avg_CPD')
+            fig_states = px.bar(
+                top_states, x=loc_col, y='Avg_CPD',
+                color='Physical_Risk', color_continuous_scale='YlOrRd',
+                title='Top 10 States by Average CPD',
+                labels={'Avg_CPD': 'Avg CPD', loc_col: 'State', 'Physical_Risk': 'Physical Risk'},
+                hover_data={'Loan_Count': True, 'Avg_Uplift': ':.1f'},
+            )
+            fig_states.update_layout(template=_plotly_template(), height=380)
+            st.plotly_chart(fig_states, use_container_width=True)
         else:
             st.info("No `addr_state` column found. Upload data with state codes for the heatmap.")
 
