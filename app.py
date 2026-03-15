@@ -20,7 +20,7 @@ import folium
 from streamlit_folium import st_folium
 
 import config
-from cpd_engine import get_baseline_pd, add_climate_features
+from cpd_engine import get_baseline_pd, add_climate_features, check_feature_drift
 from physical_risk import apply_physical_risk
 from transition_risk import apply_transition_risk
 from report_gen import generate_pdf_report
@@ -102,7 +102,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("**Model**: XGBoost (Optuna-tuned) + LightGBM + SHAP")
+    st.markdown("**Model**: XGBoost (calibrated, Optuna-tuned) + SHAP")
     st.markdown("**Climate**: NASA POWER API + NGFS Phase V")
     st.markdown("**Regulatory**: RBI Climate Risk Framework 2024")
     st.markdown("---")

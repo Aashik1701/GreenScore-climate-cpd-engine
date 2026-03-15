@@ -330,6 +330,27 @@ RISK_BINS = [0, 0.05, 0.15, 0.30, 1.0]
 RISK_LABELS = ['Low', 'Medium', 'High', 'Critical']
 
 # ─────────────────────────────────────────────────────────
+# Decision Threshold (Phase 12.2)
+# ─────────────────────────────────────────────────────────
+# Overwritten by train_baseline_pd() after each training run.
+# Default 0.5 is conservative; cost-optimal threshold is written to
+# models/optimal_threshold.txt and loaded back at import time.
+OPTIMAL_THRESHOLD = 0.5
+
+# Lender cost matrix for threshold optimisation:
+#   FN cost = 5  (missing a real default → lose ~LGD × loan principal)
+#   FP cost = 1  (rejecting a good borrower → lose net interest margin)
+FN_COST = 5
+FP_COST = 1
+
+# ─────────────────────────────────────────────────────────
+# PSI Drift Detection (Phase 12.3)
+# ─────────────────────────────────────────────────────────
+PSI_BINS = 10          # Number of quantile bins for PSI computation
+PSI_MODERATE = 0.10   # PSI threshold: below = stable
+PSI_CRITICAL = 0.25   # PSI threshold: above = significant drift — retrain
+
+# ─────────────────────────────────────────────────────────
 # Portfolio Loss Estimation (Expected Loss = PD × LGD × EAD)
 # ─────────────────────────────────────────────────────────
 # LGD (Loss Given Default): Basel II foundation IRB for unsecured consumer = 0.45

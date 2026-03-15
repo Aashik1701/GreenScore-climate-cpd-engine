@@ -18,11 +18,13 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     PrecisionRecallDisplay,
     RocCurveDisplay,
     classification_report,
+    precision_recall_curve,
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
@@ -259,9 +261,13 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
     scale_pos_weight = neg / pos
     logger.info("Class balance — neg: %s, pos: %s, scale_pos_weight: %.2f", neg, pos, scale_pos_weight)
 
-    # ── Hold-out split ──
-    X_train, X_test, y_train, y_test = train_test_split(
+    # ── Three-way split: 60% train / 20% calibration / 20% test ──
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
         X, y, test_size=config.TEST_SIZE, random_state=config.RANDOM_STATE, stratify=y,
+    )
+    # Split trainval into train (75%) and calib (25%) → 60/20/20 overall
+    X_train, X_calib, y_train, y_calib = train_test_split(
+        X_trainval, y_trainval, test_size=0.25, random_state=config.RANDOM_STATE, stratify=y_trainval,
     )
 
     # ── Optuna Hyperparameter Tuning ──
@@ -317,8 +323,16 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
         eval_set=[(X_test, y_test)],
         verbose=False,
     )
-    xgb_auc = roc_auc_score(y_test, xgb.predict_proba(X_test)[:, 1])
-    logger.info("XGBoost AUC: %.4f", xgb_auc)
+    xgb_auc_raw = roc_auc_score(y_test, xgb.predict_proba(X_test)[:, 1])
+    logger.info("XGBoost AUC (raw, before calibration): %.4f", xgb_auc_raw)
+
+    # ── Phase 12.1: Isotonic Probability Calibration ──
+    # Calibrate on the held-out calibration set so the model was never
+    # trained on those samples (cv='prefit' = calibrate a pre-fitted estimator).
+    calibrated_model = CalibratedClassifierCV(xgb, method='isotonic', cv='prefit')
+    calibrated_model.fit(X_calib, y_calib)
+    xgb_auc = roc_auc_score(y_test, calibrated_model.predict_proba(X_test)[:, 1])
+    logger.info("XGBoost AUC (calibrated): %.4f", xgb_auc)
 
     logger.info("Model trained on %d features: %s", X.shape[1], list(X.columns))
 
@@ -361,9 +375,11 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        # Confusion Matrix
+        # Confusion Matrix (calibrated model, cost-optimal threshold pre-computed below)
         fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
-        ConfusionMatrixDisplay.from_estimator(xgb, X_test, y_test, ax=ax_cm, cmap='Blues')
+        ConfusionMatrixDisplay.from_estimator(
+            xgb, X_test, y_test, ax=ax_cm, cmap='Blues',
+        )
         ax_cm.set_title('XGBoost — Confusion Matrix')
         fig_cm.tight_layout()
         fig_cm.savefig(os.path.join(save_dir, 'confusion_matrix.png'), dpi=150)
@@ -371,7 +387,8 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
 
         # ROC Curve — all models
         fig_roc, ax_roc = plt.subplots(figsize=(8, 6))
-        RocCurveDisplay.from_estimator(xgb, X_test, y_test, ax=ax_roc, name='XGBoost')
+        RocCurveDisplay.from_estimator(calibrated_model, X_test, y_test, ax=ax_roc, name='XGBoost (calibrated)')
+        RocCurveDisplay.from_estimator(xgb, X_test, y_test, ax=ax_roc, name='XGBoost (raw)', linestyle='--', alpha=0.6)
         RocCurveDisplay.from_estimator(lr, X_test, y_test, ax=ax_roc, name='Logistic Regression')
         RocCurveDisplay.from_estimator(rf, X_test, y_test, ax=ax_roc, name='Random Forest')
         RocCurveDisplay.from_estimator(lgbm, X_test, y_test, ax=ax_roc, name='LightGBM')
@@ -382,7 +399,7 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
 
         # Precision-Recall Curve
         fig_pr, ax_pr = plt.subplots(figsize=(8, 6))
-        PrecisionRecallDisplay.from_estimator(xgb, X_test, y_test, ax=ax_pr, name='XGBoost')
+        PrecisionRecallDisplay.from_estimator(calibrated_model, X_test, y_test, ax=ax_pr, name='XGBoost (calibrated)')
         PrecisionRecallDisplay.from_estimator(lr, X_test, y_test, ax=ax_pr, name='Logistic Regression')
         PrecisionRecallDisplay.from_estimator(rf, X_test, y_test, ax=ax_pr, name='Random Forest')
         PrecisionRecallDisplay.from_estimator(lgbm, X_test, y_test, ax=ax_pr, name='LightGBM')
@@ -395,7 +412,7 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
     except Exception as e:
         logger.warning("Could not save evaluation plots: %s", e)
 
-    # ── SHAP Feature Importance ──
+    # ── SHAP Feature Importance (use raw XGBoost — TreeExplainer needs a tree model) ──
     try:
         import shap
         import matplotlib
@@ -422,20 +439,81 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
     except Exception as e:
         logger.warning("Could not save SHAP plots: %s", e)
 
-    # ── Classification report ──
-    y_pred = xgb.predict(X_test)
+    # ── Phase 12.2: Cost-Optimal Threshold ──
+    y_prob_cal = calibrated_model.predict_proba(X_test)[:, 1]
+    prec, rec, thresholds = precision_recall_curve(y_test, y_prob_cal)
+    # Cost function: FN_COST * FN_rate + FP_COST * FP_rate
+    # FN_rate = 1 - recall;  FP_rate = (1 - precision) * (pos_in_test / neg_in_test)
+    fn_costs = config.FN_COST * (1 - rec[:-1])
+    fp_costs = config.FP_COST * (1 - prec[:-1])
+    total_cost = fn_costs + fp_costs
+    best_idx = int(np.argmin(total_cost))
+    optimal_threshold = float(thresholds[best_idx])
+    # Also compute F1-optimal threshold for reference
+    f1_scores = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-8)
+    f1_optimal_threshold = float(thresholds[int(np.argmax(f1_scores))])
+    logger.info(
+        "Optimal threshold (cost-based): %.4f   F1-optimal: %.4f",
+        optimal_threshold, f1_optimal_threshold,
+    )
+    # Write to file so app.py / other scripts can load it without retraining
+    threshold_path = os.path.join(save_dir, 'optimal_threshold.txt')
+    with open(threshold_path, 'w') as f:
+        f.write(f"cost_optimal={optimal_threshold:.6f}\n")
+        f.write(f"f1_optimal={f1_optimal_threshold:.6f}\n")
+        f.write(f"fn_cost={config.FN_COST}\nfp_cost={config.FP_COST}\n")
+
+    # ── Phase 12.1: Calibration plot (reliability diagram) ──
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig_cal, ax_cal = plt.subplots(figsize=(7, 6))
+        # Raw XGBoost
+        frac_raw, mean_raw = calibration_curve(
+            y_test, xgb.predict_proba(X_test)[:, 1], n_bins=15, strategy='quantile',
+        )
+        # Calibrated
+        frac_cal, mean_cal = calibration_curve(
+            y_test, y_prob_cal, n_bins=15, strategy='quantile',
+        )
+        ax_cal.plot([0, 1], [0, 1], 'k--', label='Perfect calibration')
+        ax_cal.plot(mean_raw, frac_raw, 's-', label=f'Raw XGBoost (AUC={xgb_auc_raw:.4f})', alpha=0.8)
+        ax_cal.plot(mean_cal, frac_cal, 'o-', label=f'Calibrated (AUC={xgb_auc:.4f})', alpha=0.8)
+        ax_cal.set_xlabel('Mean predicted probability')
+        ax_cal.set_ylabel('Fraction of positives')
+        ax_cal.set_title('Reliability Diagram — Probability Calibration')
+        ax_cal.legend(loc='upper left')
+        ax_cal.set_xlim(0, 1); ax_cal.set_ylim(0, 1)
+        fig_cal.tight_layout()
+        fig_cal.savefig(os.path.join(save_dir, 'calibration_curve.png'), dpi=150)
+        plt.close(fig_cal)
+        logger.info("Calibration plot saved to %s/calibration_curve.png", save_dir)
+    except Exception as e:
+        logger.warning("Could not save calibration plot: %s", e)
+
+    # ── Classification report (using calibrated model + cost-optimal threshold) ──
+    y_pred = (y_prob_cal >= optimal_threshold).astype(int)
     report = classification_report(y_test, y_pred, target_names=['Paid', 'Default'])
-    logger.info("Classification Report:\n%s", report)
+    logger.info("Classification Report (threshold=%.4f):\n%s", optimal_threshold, report)
     with open(os.path.join(save_dir, 'classification_report.txt'), 'w') as f:
+        f.write(f"Threshold: {optimal_threshold:.6f} (cost-optimal, FN:FP={config.FN_COST}:{config.FP_COST})\n\n")
         f.write(report)
 
-    # ── Save the best model (XGBoost) ──
+    # ── Save training feature statistics for PSI drift detection ──
+    feat_stats = X_train.describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9]).T
+    feat_stats.to_csv(os.path.join(save_dir, 'training_feature_stats.csv'))
+    logger.info("Training feature stats saved for drift detection.")
+
+    # ── Save the calibrated model ──
     model_path = os.path.join(save_dir, 'baseline_pd_model.pkl')
-    joblib.dump(xgb, model_path)
-    logger.info("Model saved to %s", model_path)
+    joblib.dump(calibrated_model, model_path)
+    logger.info("Calibrated model saved to %s", model_path)
 
     results = {
         'xgboost_auc': xgb_auc,
+        'xgboost_auc_raw': xgb_auc_raw,
         'xgboost_cv_mean': xgb_cv_scores.mean(),
         'xgboost_cv_std': xgb_cv_scores.std(),
         'logistic_regression_auc': lr_auc,
@@ -443,10 +521,12 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
         'lightgbm_auc': lgbm_auc,
         'scale_pos_weight': scale_pos_weight,
         'n_samples': len(df),
-        'default_rate': y.mean(),
+        'default_rate': float(y.mean()),
+        'optimal_threshold': optimal_threshold,
+        'f1_optimal_threshold': f1_optimal_threshold,
         'tuned': tune,
     }
-    return xgb, results
+    return calibrated_model, results
 
 
 # ─────────────────────────────────────────────────────────
@@ -514,6 +594,121 @@ def get_baseline_pd(model, loan_data: pd.DataFrame) -> np.ndarray:
 
     X = df[feature_cols].fillna(df[feature_cols].median())
     return model.predict_proba(X)[:, 1]
+
+
+# ─────────────────────────────────────────────────────────
+# PSI Drift Detection (Phase 12.3)
+# ─────────────────────────────────────────────────────────
+
+def compute_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = None) -> float:
+    """
+    Population Stability Index (PSI) between two distributions.
+
+    PSI < 0.10  → stable (no meaningful drift)
+    0.10-0.25   → moderate drift (investigate)
+    PSI > 0.25  → significant drift (retrain recommended)
+
+    Parameters
+    ----------
+    expected : np.ndarray
+        Feature values from the training distribution.
+    actual : np.ndarray
+        Feature values from the new / scored dataset.
+    n_bins : int, optional
+        Number of quantile bins. Defaults to ``config.PSI_BINS``.
+
+    Returns
+    -------
+    float
+        PSI value.
+    """
+    if n_bins is None:
+        n_bins = config.PSI_BINS
+
+    # Build bin edges from expected distribution (quantile-based)
+    percentiles = np.linspace(0, 100, n_bins + 1)
+    bin_edges = np.unique(np.percentile(expected, percentiles))
+
+    # Ensure at least 2 distinct edges
+    if len(bin_edges) < 2:
+        return 0.0
+
+    # Extend edges to capture full range
+    bin_edges[0] -= 1e-8
+    bin_edges[-1] += 1e-8
+
+    expected_counts, _ = np.histogram(expected, bins=bin_edges)
+    actual_counts, _ = np.histogram(actual, bins=bin_edges)
+
+    # Convert to proportions; replace zeros to avoid log(0)
+    expected_pct = np.where(expected_counts == 0, 1e-4, expected_counts / len(expected))
+    actual_pct = np.where(actual_counts == 0, 1e-4, actual_counts / max(len(actual), 1))
+
+    psi = float(np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct)))
+    return psi
+
+
+def check_feature_drift(
+    new_data: pd.DataFrame,
+    stats_path: str = 'models/training_feature_stats.csv',
+) -> pd.DataFrame:
+    """
+    Compute PSI for all model features between the training distribution
+    (loaded from ``stats_path``) and ``new_data``.
+
+    Returns a DataFrame sorted by PSI descending, with a ``status`` column:
+    - ``OK``       — PSI < 0.10
+    - ``MODERATE`` — 0.10 ≤ PSI < 0.25
+    - ``DRIFT``    — PSI ≥ 0.25 (retrain recommended)
+    """
+    if not os.path.exists(stats_path):
+        logger.warning("Training feature stats not found at %s. Run training first.", stats_path)
+        return pd.DataFrame(columns=['feature', 'psi', 'status'])
+
+    train_stats = pd.read_csv(stats_path, index_col=0)
+
+    results = []
+    for col in config.ALL_FEATURES:
+        if col not in new_data.columns:
+            continue
+        if col not in train_stats.index:
+            continue
+
+        # Reconstruct approximate training distribution from percentile stats
+        row = train_stats.loc[col]
+        # Build synthetic reference values from stored percentile summary
+        ref_vals = np.array([
+            row.get('min', 0), row.get('10%', 0), row.get('25%', 0),
+            row.get('50%', 0), row.get('75%', 0), row.get('90%', 0),
+            row.get('max', 1),
+        ], dtype=float)
+        # Weight the reference values to approximate the full distribution
+        weights = np.array([5, 10, 15, 20, 15, 10, 5], dtype=float)
+        ref = np.repeat(ref_vals, (weights * 100 / weights.sum()).astype(int))
+
+        actual = new_data[col].dropna().values.astype(float)
+        if len(actual) == 0:
+            continue
+
+        psi = compute_psi(ref, actual)
+        if psi >= config.PSI_CRITICAL:
+            status = 'DRIFT'
+        elif psi >= config.PSI_MODERATE:
+            status = 'MODERATE'
+        else:
+            status = 'OK'
+
+        results.append({'feature': col, 'psi': round(psi, 5), 'status': status})
+
+    drift_df = pd.DataFrame(results).sort_values('psi', ascending=False).reset_index(drop=True)
+    n_drift = (drift_df['status'] == 'DRIFT').sum()
+    n_moderate = (drift_df['status'] == 'MODERATE').sum()
+    logger.info(
+        "Drift check: %d features — %d DRIFT, %d MODERATE, %d OK",
+        len(drift_df), n_drift, n_moderate,
+        (drift_df['status'] == 'OK').sum(),
+    )
+    return drift_df
 
 
 # ─────────────────────────────────────────────────────────
@@ -639,12 +834,15 @@ if __name__ == '__main__':
         df = add_climate_features(df)
         model, results = train_baseline_pd(df, tune=do_tune)
         print("\n═══ Model Comparison ═══")
-        print(f"  XGBoost AUC (hold-out):   {results['xgboost_auc']:.4f}")
-        print(f"  XGBoost AUC (5-fold CV):  {results['xgboost_cv_mean']:.4f} ± {results['xgboost_cv_std']:.4f}")
-        print(f"  Logistic Regression AUC:  {results['logistic_regression_auc']:.4f}")
-        print(f"  Random Forest AUC:        {results['random_forest_auc']:.4f}")
-        print(f"  LightGBM AUC:             {results['lightgbm_auc']:.4f}")
-        print(f"  Scale Pos Weight:         {results['scale_pos_weight']:.2f}")
+        print(f"  XGBoost AUC (calibrated):  {results['xgboost_auc']:.4f}")
+        print(f"  XGBoost AUC (raw):         {results['xgboost_auc_raw']:.4f}")
+        print(f"  XGBoost AUC (5-fold CV):   {results['xgboost_cv_mean']:.4f} ± {results['xgboost_cv_std']:.4f}")
+        print(f"  Logistic Regression AUC:   {results['logistic_regression_auc']:.4f}")
+        print(f"  Random Forest AUC:         {results['random_forest_auc']:.4f}")
+        print(f"  LightGBM AUC:              {results['lightgbm_auc']:.4f}")
+        print(f"  Scale Pos Weight:          {results['scale_pos_weight']:.2f}")
+        print(f"  Cost-optimal threshold:    {results['optimal_threshold']:.4f}")
+        print(f"  F1-optimal threshold:      {results['f1_optimal_threshold']:.4f}")
         if results['tuned']:
             print("  Optuna Tuning:            ✅ Applied")
         print(f"\nModel + plots + SHAP saved to models/")
