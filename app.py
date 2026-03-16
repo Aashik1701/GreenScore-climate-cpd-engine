@@ -223,6 +223,25 @@ if df is not None:
             cpd, bins=config.RISK_BINS, labels=config.RISK_LABELS, include_lowest=True,
         )
 
+    # ── Phase 12.3: Feature Drift Warning ──
+    if os.path.exists('models/training_feature_stats.csv'):
+        drift_df = check_feature_drift(df)
+        n_drift = (drift_df['status'] == 'DRIFT').sum()
+        n_moderate = (drift_df['status'] == 'MODERATE').sum()
+        if n_drift > 0:
+            drifted = drift_df[drift_df['status'] == 'DRIFT']['feature'].tolist()
+            st.warning(
+                f"⚠️ **Feature Drift Detected** — {n_drift} feature(s) show significant "
+                f"distribution shift from training data (PSI ≥ {config.PSI_CRITICAL}): "
+                f"`{'`, `'.join(drifted[:5])}{'…' if len(drifted) > 5 else ''}`. "
+                "Consider retraining the model on more recent data."
+            )
+        elif n_moderate > 0:
+            st.info(
+                f"ℹ️ **Moderate drift** in {n_moderate} feature(s) (PSI ≥ {config.PSI_MODERATE}). "
+                "Predictions remain reliable but monitor closely."
+            )
+
     # ═══════════════════════════════════════════════
     # TABS
     # ═══════════════════════════════════════════════
@@ -827,7 +846,7 @@ if df is not None:
     # ═══════════════════════════════════════════════
     st.markdown("---")
     st.subheader("Export Results")
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
 
     with col_a:
         csv_data = df[display_cols].to_csv(index=False)
@@ -837,12 +856,124 @@ if df is not None:
         )
 
     with col_b:
+        # Build EL breakdown for enhanced PDF (if EL tab has run, values are already present)
+        pdf_el_breakdown = None
+        if all(c in df.columns for c in ['Risk_Category', 'EAD', 'Expected_Loss', 'CPD_2030']):
+            pdf_el_breakdown = df.groupby('Risk_Category', observed=True).agg(
+                Count=('Expected_Loss', 'count'),
+                Total_EAD=('EAD', 'sum'),
+                Total_EL=('Expected_Loss', 'sum'),
+                Avg_CPD=('CPD_2030', 'mean'),
+            ).reset_index()
+            pdf_el_breakdown['EL_Rate'] = pdf_el_breakdown['Total_EL'] / (pdf_el_breakdown['Total_EAD'] + 1e-8)
+
+        # Build scenario summary table from precomputed scenario arrays
+        pdf_scenarios = []
+        try:
+            for sc_name, sc_price in config.CARBON_PRICES.items():
+                sc_cpd = scenario_results[sc_name]
+                sc_uplift = ((sc_cpd - baseline_pd) / (baseline_pd + 1e-8) * 100).mean()
+                pdf_scenarios.append({
+                    'Scenario': sc_name.replace('_', ' ').title(),
+                    'Carbon Price': f'${sc_price}/tCO₂',
+                    'Avg CPD 2030': f'{sc_cpd.mean():.4f}',
+                    'Avg Uplift': f'{sc_uplift:.1f}%',
+                })
+        except Exception:
+            pdf_scenarios = None
+
+        # Build SHAP waterfall dataframe for top-risk loan
+        pdf_shap_df = None
+        try:
+            model_n_features = getattr(model, 'n_features_in_', len(config.ALL_FEATURES))
+            feat_names = config.ALL_FEATURES_CLIMATE if model_n_features > len(config.ALL_FEATURES) else config.ALL_FEATURES
+            top_idx = int(df['CPD_2030'].idxmax())
+            X_pdf = df.loc[[top_idx], feat_names].copy()
+            for feat in feat_names:
+                if feat not in X_pdf.columns:
+                    X_pdf[feat] = 0
+            X_pdf = X_pdf.fillna(X_pdf.median())
+
+            explainer = _get_shap_explainer(model)
+            shap_vals = explainer(X_pdf)
+            pdf_shap_df = pd.DataFrame({
+                'Feature': feat_names,
+                'SHAP Value': shap_vals.values[0],
+            }).sort_values('SHAP Value', key=abs, ascending=False).head(12)
+        except Exception:
+            pdf_shap_df = None
+
         # Pre-generate PDF to fix two-click bug
-        pdf_bytes = generate_pdf_report(df, scenario, baseline_pd.mean(), cpd.mean())
+        pdf_bytes = generate_pdf_report(
+            df,
+            scenario,
+            baseline_pd.mean(),
+            cpd.mean(),
+            shap_waterfall_df=pdf_shap_df,
+            el_breakdown_df=pdf_el_breakdown,
+            scenario_summary=pdf_scenarios,
+        )
         st.download_button(
             "Download RBI Disclosure PDF", pdf_bytes,
             "rbi_climate_disclosure.pdf", "application/pdf", use_container_width=True,
         )
+
+    with col_c:
+        import io as _io
+        import importlib.util as _importlib_util
+
+        xlsx_buf = _io.BytesIO()
+        excel_engine = None
+        if _importlib_util.find_spec("openpyxl") is not None:
+            excel_engine = "openpyxl"
+        elif _importlib_util.find_spec("xlsxwriter") is not None:
+            excel_engine = "xlsxwriter"
+
+        if excel_engine is None:
+            st.warning(
+                "Excel export requires `openpyxl` or `xlsxwriter`. "
+                "Showing CSV fallback for this environment."
+            )
+            st.download_button(
+                "Download Results CSV (Fallback)",
+                df[display_cols].to_csv(index=False),
+                "cpd_results_fallback.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+        else:
+            with pd.ExcelWriter(xlsx_buf, engine=excel_engine) as writer:
+                df[display_cols].to_excel(writer, sheet_name="Loan Level", index=False)
+
+                summary_data = {
+                    "Metric": [
+                        "Total Loans", "Scenario", "Avg Baseline PD", "Avg CPD",
+                        "Avg PD Uplift %", "Total Expected Loss (USD)",
+                    ],
+                    "Value": [
+                        len(df),
+                        scenario,
+                        f"{baseline_pd.mean():.4f}",
+                        f"{cpd.mean():.4f}",
+                        f"{((cpd.mean() - baseline_pd.mean()) / (baseline_pd.mean() + 1e-8) * 100):.2f}%",
+                        f"${df['Expected_Loss'].sum():,.0f}" if "Expected_Loss" in df.columns else "N/A",
+                    ],
+                }
+                pd.DataFrame(summary_data).to_excel(writer, sheet_name="Portfolio Summary", index=False)
+
+                if "Risk_Category" in df.columns:
+                    pd.DataFrame(
+                        df["Risk_Category"].value_counts().rename_axis("Risk Category").reset_index(name="Count")
+                    ).to_excel(writer, sheet_name="Risk Distribution", index=False)
+
+            xlsx_buf.seek(0)
+            st.download_button(
+                "Download Results Excel",
+                xlsx_buf.getvalue(),
+                "cpd_results.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 else:
     # ── Landing State ──

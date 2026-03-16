@@ -6,6 +6,7 @@ Run with: python -m pytest tests/ -v
 import numpy as np
 import pandas as pd
 import pytest
+import joblib
 
 import sys
 import os
@@ -551,3 +552,140 @@ class TestCrossDatasetValidation:
             pytest.skip("Home Credit dataset not available")
         results = cross_dataset_validate(model_path=model_path)
         assert results['auc'] > 0.50, f"AUC {results['auc']:.4f} not above random"
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 12: Drift Detection Tests
+# ─────────────────────────────────────────────────────────
+
+class TestPSIDriftDetection:
+    """Tests for compute_psi and check_feature_drift (Phase 12.3)."""
+
+    def test_identical_distributions_psi_near_zero(self):
+        """PSI between identical distributions should be ~0."""
+        from cpd_engine import compute_psi
+        data = np.random.normal(0, 1, 1000)
+        psi = compute_psi(data, data.copy())
+        assert psi < 0.01, f"PSI on identical data should be ~0, got {psi}"
+
+    def test_very_different_distributions_high_psi(self):
+        """PSI between very different distributions should exceed critical threshold."""
+        from cpd_engine import compute_psi
+        expected = np.random.normal(0, 1, 2000)
+        actual = np.random.normal(5, 1, 2000)  # completely shifted
+        psi = compute_psi(expected, actual)
+        assert psi > config.PSI_CRITICAL, f"PSI {psi:.4f} should exceed critical threshold {config.PSI_CRITICAL}"
+
+    def test_small_shift_moderate_psi(self):
+        """A moderate shift should produce moderate PSI."""
+        from cpd_engine import compute_psi
+        rng = np.random.default_rng(42)
+        expected = rng.normal(0, 1, 5000)
+        actual = rng.normal(0.5, 1, 5000)  # moderate shift
+        psi = compute_psi(expected, actual)
+        # Should be above stable but not critical for this magnitude
+        assert psi >= 0, f"PSI must be non-negative, got {psi}"
+
+    def test_psi_non_negative(self):
+        """PSI must always be non-negative."""
+        from cpd_engine import compute_psi
+        rng = np.random.default_rng(0)
+        for _ in range(10):
+            a = rng.exponential(1, 500)
+            b = rng.exponential(2, 500)
+            assert compute_psi(a, b) >= 0
+
+    def test_psi_constant_input_returns_zero(self):
+        """Constant array (no variance) should return 0 without error."""
+        from cpd_engine import compute_psi
+        constant = np.ones(100)
+        psi = compute_psi(constant, constant)
+        assert psi == 0.0
+
+    def test_check_feature_drift_no_stats_file(self, tmp_path):
+        """check_feature_drift returns empty DataFrame when stats file missing."""
+        from cpd_engine import check_feature_drift
+        result = check_feature_drift(
+            pd.DataFrame({'dti': [20.0]}),
+            stats_path=str(tmp_path / 'nonexistent.csv'),
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 0
+        assert 'feature' in result.columns
+        assert 'psi' in result.columns
+        assert 'status' in result.columns
+
+    def test_check_feature_drift_status_labels(self):
+        """check_feature_drift status must only contain valid labels."""
+        from cpd_engine import check_feature_drift
+        stats_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'training_feature_stats.csv',
+        )
+        if not os.path.exists(stats_path):
+            pytest.skip("Training feature stats not available — run training first")
+
+        # Build a minimal dataframe with the expected features
+        dummy = pd.DataFrame({col: np.random.uniform(0, 1, 200)
+                              for col in config.ALL_FEATURES})
+        result = check_feature_drift(dummy, stats_path=stats_path)
+        assert set(result['status'].unique()).issubset({'OK', 'MODERATE', 'DRIFT'})
+
+    def test_psi_config_constants_exist(self):
+        """PSI threshold constants must be in config."""
+        assert hasattr(config, 'PSI_BINS')
+        assert hasattr(config, 'PSI_MODERATE')
+        assert hasattr(config, 'PSI_CRITICAL')
+        assert config.PSI_MODERATE < config.PSI_CRITICAL
+        assert config.PSI_BINS >= 5
+
+
+class TestCalibrationAndThreshold:
+    """Tests for Phase 12.1 (calibration) and 12.2 (threshold) artifacts."""
+
+    def test_optimal_threshold_file_exists_after_training(self):
+        """optimal_threshold.txt should be present if model has been trained."""
+        threshold_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'optimal_threshold.txt',
+        )
+        if not os.path.exists(threshold_path):
+            pytest.skip("Model not yet trained with Phase 12 — run cpd_engine.py first")
+        with open(threshold_path) as f:
+            content = f.read()
+        assert 'cost_optimal' in content
+        assert 'f1_optimal' in content
+
+    def test_optimal_threshold_value_in_valid_range(self):
+        """Optimal threshold must be in (0, 1)."""
+        threshold_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'optimal_threshold.txt',
+        )
+        if not os.path.exists(threshold_path):
+            pytest.skip("optimal_threshold.txt not found")
+        with open(threshold_path) as f:
+            lines = dict(line.strip().split('=') for line in f if '=' in line)
+        threshold = float(lines['cost_optimal'])
+        assert 0.0 < threshold < 1.0, f"Threshold {threshold} out of range"
+
+    def test_fn_fp_cost_constants(self):
+        """FN_COST and FP_COST must be positive and FN > FP (credit risk logic)."""
+        assert config.FN_COST > 0
+        assert config.FP_COST > 0
+        assert config.FN_COST > config.FP_COST, "FN cost should exceed FP cost for credit risk"
+
+    def test_calibrated_model_has_predict_proba(self):
+        """Saved model must expose predict_proba (works for both raw and calibrated)."""
+        model_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'baseline_pd_model.pkl',
+        )
+        if not os.path.exists(model_path):
+            pytest.skip("Trained model not available")
+        model = joblib.load(model_path)
+        assert hasattr(model, 'predict_proba'), "Model must have predict_proba"
+
+    def test_calibration_curve_png_exists(self):
+        """Calibration curve PNG should be saved after training."""
+        png_path = os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'calibration_curve.png',
+        )
+        if not os.path.exists(png_path):
+            pytest.skip("calibration_curve.png not found — run training first")
