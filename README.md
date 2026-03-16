@@ -50,6 +50,34 @@ By 2030, physical hazard events (floods, cyclones, heatwaves) and transition pol
 
 ---
 
+## Dashboard Preview
+
+### Animated Walkthrough
+
+![GreenScore Dashboard Tour](docs/media/dashboard_tour.gif)
+
+### Key Screens
+
+| Landing | Portfolio Overview |
+|:--:|:--:|
+| ![Landing](docs/media/01_landing.png) | ![Overview](docs/media/02_overview.png) |
+
+| Multi-Scenario | Geographic Heatmap |
+|:--:|:--:|
+| ![Multi Scenario](docs/media/03_multi_scenario.png) | ![Heatmap](docs/media/04_heatmap.png) |
+
+| Expected Loss |
+|:--:|
+| ![Expected Loss](docs/media/05_expected_loss.png) |
+
+### Refresh Screenshots Locally
+
+```bash
+/Users/mohammedaashik/Documents/PROJECT/Green-Score/.venv/bin/python scripts/capture_dashboard_media.py --url http://localhost:8501 --out docs/media
+```
+
+---
+
 ## Architecture
 
 ### Repository Structure
