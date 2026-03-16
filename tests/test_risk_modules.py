@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import joblib
+from fastapi.testclient import TestClient
 
 import sys
 import os
@@ -689,3 +690,103 @@ class TestCalibrationAndThreshold:
         )
         if not os.path.exists(png_path):
             pytest.skip("calibration_curve.png not found — run training first")
+
+
+class TestFastAPIEndpoints:
+    """Tests for Phase 12.4 and 12.5 FastAPI endpoints."""
+
+    @staticmethod
+    def _mock_pipeline(df: pd.DataFrame, scenario: str, severity_factor: float, transition_scaling: float) -> pd.DataFrame:
+        out = df.copy()
+        n = len(out)
+        out["Baseline_PD"] = np.full(n, 0.08)
+        out["CPD"] = np.full(n, 0.10)
+        out["PD_Uplift_Pct"] = np.full(n, 25.0)
+        out["Risk_Category"] = np.full(n, "Medium")
+        out["Expected_Loss"] = out.get("loan_amnt", pd.Series([10000.0] * n, index=out.index)) * 0.10 * config.DEFAULT_LGD
+        return out
+
+    def test_health_endpoint(self):
+        import api
+
+        client = TestClient(api.app)
+        resp = client.get('/health')
+        assert resp.status_code == 200
+        body = resp.json()
+        assert 'status' in body
+        assert 'scenarios' in body
+        assert isinstance(body['scenarios'], list)
+
+    def test_predict_single_success(self, monkeypatch):
+        import api
+
+        monkeypatch.setattr(api, '_get_model', lambda: object())
+        monkeypatch.setattr(api, 'add_climate_features', lambda df: df)
+        monkeypatch.setattr(api, '_run_cpd_pipeline', self._mock_pipeline)
+
+        client = TestClient(api.app)
+        payload = {
+            'dti': 18.5,
+            'annual_inc': 85000,
+            'fico_range_low': 705,
+            'int_rate': 11.2,
+            'installment': 320,
+            'loan_amnt': 12000,
+            'addr_state': 'CA',
+            'purpose': 'debt_consolidation',
+            'scenario': 'orderly',
+        }
+        resp = client.post('/predict', json=payload)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert 'baseline_pd' in body
+        assert 'cpd' in body
+        assert 'expected_loss' in body
+        assert body['scenario'] == 'orderly'
+
+    def test_predict_single_invalid_scenario(self):
+        import api
+
+        client = TestClient(api.app)
+        payload = {
+            'dti': 18.5,
+            'annual_inc': 85000,
+            'fico_range_low': 705,
+            'int_rate': 11.2,
+            'installment': 320,
+            'scenario': 'invalid_scenario',
+        }
+        resp = client.post('/predict', json=payload)
+        assert resp.status_code == 422
+
+    def test_predict_batch_json_success(self, monkeypatch):
+        import api
+
+        monkeypatch.setattr(api, '_get_model', lambda: object())
+        monkeypatch.setattr(api, 'add_climate_features', lambda df: df)
+        monkeypatch.setattr(api, '_run_cpd_pipeline', self._mock_pipeline)
+
+        client = TestClient(api.app)
+        csv_data = (
+            "dti,annual_inc,fico_range_low,int_rate,installment,loan_amnt,addr_state,purpose\n"
+            "15,90000,720,10.5,300,10000,CA,debt_consolidation\n"
+            "22,65000,680,13.2,250,8000,TX,small_business\n"
+        )
+        files = {'file': ('portfolio.csv', csv_data, 'text/csv')}
+        resp = client.post('/predict/batch?scenario=orderly&output_format=json', files=files)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert 'summary' in body
+        assert 'loans' in body
+        assert body['summary']['n_scored'] == 2
+
+    def test_predict_batch_missing_required_column(self, monkeypatch):
+        import api
+
+        monkeypatch.setattr(api, '_get_model', lambda: object())
+
+        client = TestClient(api.app)
+        csv_data = "annual_inc,fico_range_low,int_rate,installment\n90000,720,10.5,300\n"
+        files = {'file': ('bad_portfolio.csv', csv_data, 'text/csv')}
+        resp = client.post('/predict/batch?scenario=orderly', files=files)
+        assert resp.status_code == 422
