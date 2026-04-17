@@ -334,6 +334,10 @@ def train_baseline_pd(df: pd.DataFrame, save_dir: str = 'models', tune: bool = F
     xgb_auc = roc_auc_score(y_test, calibrated_model.predict_proba(X_test)[:, 1])
     logger.info("XGBoost AUC (calibrated): %.4f", xgb_auc)
 
+    from sklearn.metrics import brier_score_loss
+    brier_score = brier_score_loss(y_test, calibrated_model.predict_proba(X_test)[:, 1])
+    logger.info("XGBoost Brier Score (calibrated): %.4f", brier_score)
+
     logger.info("Model trained on %d features: %s", X.shape[1], list(X.columns))
 
     # ── 5-Fold Stratified CV for XGBoost ──
